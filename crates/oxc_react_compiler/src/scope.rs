@@ -112,6 +112,9 @@ pub struct ScopeResolver<'s, 'a> {
     scoping: &'s Scoping,
     nodes: &'s AstNodes<'s>,
     allocator: &'a Allocator,
+    /// TypeScript source mode does not apply Annex B semantics, including when the
+    /// file contains only JavaScript-shaped syntax.
+    is_typescript_source: bool,
     /// All Function-kind scopes, in scope-tree order.
     function_scopes: Vec<ScopeId>,
     /// `(start, end)` source windows of Function-kind scopes, used by the
@@ -137,6 +140,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
             scoping,
             nodes,
             allocator,
+            is_typescript_source: semantic.source_type().is_typescript(),
             function_scopes: Vec::new(),
             function_scope_ranges: Vec::new(),
             scopes_by_start: Vec::new(),
@@ -324,6 +328,90 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         flags.is_type() && !flags.is_value()
     }
 
+    /// Resolve the runtime value symbol for a value-position reference.
+    ///
+    /// Oxc may associate a value reference with an erased type-only symbol. JavaScript
+    /// runtime lookup skips that declaration, so continue through ancestor scopes until
+    /// the nearest value binding is found. `None` means the runtime lookup is global.
+    pub fn resolve_runtime_value_symbol(&self, symbol_id: SymbolId) -> Option<SymbolId> {
+        if !self.is_type_only_binding(symbol_id) {
+            return Some(symbol_id);
+        }
+
+        let name = self.symbol_name(symbol_id);
+        self.ancestors(self.scoping.symbol_scope_id(symbol_id))
+            .skip(1)
+            .filter_map(|scope_id| self.get_binding(scope_id, name))
+            .find(|&symbol_id| !self.is_type_only_binding(symbol_id))
+    }
+
+    /// Resolve the runtime symbol visible at a reference site.
+    ///
+    /// In sloppy scripts, Oxc can attach a post-block `arguments` reference to an
+    /// earlier Annex B hoisted symbol even when a later, unconditionally executed
+    /// block function supplies the runtime value. Normalize that substitution here
+    /// so lowering, context classification, and capture discovery agree.
+    pub fn resolve_runtime_symbol_at(
+        &self,
+        function_scope: ScopeId,
+        name: &str,
+        reference_position: u32,
+        symbol: Option<SymbolId>,
+    ) -> Option<SymbolId> {
+        let runtime_symbol =
+            symbol.and_then(|symbol_id| self.resolve_runtime_value_symbol(symbol_id));
+        if name != "arguments" {
+            return runtime_symbol;
+        }
+
+        self.ancestors(function_scope)
+            .find(|&scope_id| {
+                self.scope_kind(scope_id) == ScopeKind::Function && !self.is_arrow_scope(scope_id)
+            })
+            .and_then(|arguments_scope| {
+                self.visible_annex_b_function(
+                    arguments_scope,
+                    name,
+                    reference_position,
+                    runtime_symbol,
+                )
+            })
+            .or(runtime_symbol)
+    }
+
+    /// Whether a symbol has a function declaration directly in its owning function body.
+    ///
+    /// Oxc merges same-scope `var` and function declarations into one symbol, retaining
+    /// the first declaration as the symbol's primary declaration. Inspect every
+    /// redeclaration so `var name; function name() {}` is still recognized as a hoisted
+    /// function binding. Nested block and conditional Annex B declarations are excluded.
+    pub fn has_body_level_function_declaration(&self, symbol_id: SymbolId) -> bool {
+        self.scoping.symbol_declarations(symbol_id).any(|declaration_id| {
+            let declaration = self.nodes.get_node(declaration_id);
+            matches!(declaration.kind(), AstKind::Function(function) if function.is_declaration())
+                && matches!(
+                    self.nodes.parent_node(declaration.id()).kind(),
+                    AstKind::FunctionBody(_)
+                )
+        })
+    }
+
+    /// Whether a labeled statement contains a `break` that targets that label
+    /// before an enclosed Annex B function declaration is evaluated.
+    fn labeled_statement_has_escaping_break_before(
+        &self,
+        labeled_statement_id: NodeId,
+        label_name: &str,
+        declaration_position: u32,
+    ) -> bool {
+        self.nodes.iter().any(|node| {
+            matches!(node.kind(), AstKind::BreakStatement(statement)
+                if statement.label.as_ref().is_some_and(|label| label.name.as_str() == label_name)
+                    && statement.span.start < declaration_position
+                    && self.nodes.ancestor_ids(node.id()).any(|ancestor_id| ancestor_id == labeled_statement_id))
+        })
+    }
+
     /// The kind of the symbol's declaration AST node.
     pub fn decl_kind(&self, symbol_id: SymbolId) -> DeclKind {
         match self.nodes.get_node(self.scoping.symbol_declaration(symbol_id)).kind() {
@@ -355,6 +443,372 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
             AstKind::TSNamespaceDeclaration(_) => DeclKind::TSModuleDeclaration,
             _ => DeclKind::Unknown,
         }
+    }
+
+    /// Whether an Annex B function binding exists and a reference observes the implicit
+    /// `arguments` object instead of that function.
+    ///
+    /// Oxc moves sloppy-mode block function bindings into the enclosing var scope so
+    /// references outside the block resolve to the function symbol. At runtime, however,
+    /// the var-like binding is only updated when execution enters the declaration's
+    /// block. Babel leaves such outside references unresolved, while references inside
+    /// the declaration block resolve to the block function. A reference after a block
+    /// that is unconditionally entered also observes the function binding. Direct
+    /// `if`-statement functions are another Annex B form and do not get a distinct block
+    /// scope.
+    pub fn annex_b_function_observes_implicit_arguments_at(
+        &self,
+        symbol_id: SymbolId,
+        reference_position: u32,
+    ) -> Option<bool> {
+        let mut has_annex_b_declaration = false;
+        for declaration_id in self.scoping.symbol_declarations(symbol_id) {
+            let declaration = self.nodes.get_node(declaration_id);
+            let AstKind::Function(function) = declaration.kind() else {
+                continue;
+            };
+            if !self.is_annex_b_function_declaration(symbol_id, function) {
+                continue;
+            }
+
+            let parent = self.nodes.parent_node(declaration.id());
+            if matches!(parent.kind(), AstKind::SwitchCase(_)) {
+                has_annex_b_declaration = true;
+                if self.nodes.ancestors(parent.id()).any(|ancestor| {
+                    matches!(ancestor.kind(), AstKind::SwitchStatement(statement)
+                        if statement.discriminant.span().end <= reference_position
+                            && reference_position < statement.span.end)
+                }) {
+                    return Some(false);
+                }
+                continue;
+            }
+            let AstKind::BlockStatement(_) = parent.kind() else {
+                if matches!(parent.kind(), AstKind::IfStatement(_)) {
+                    has_annex_b_declaration = true;
+                }
+                continue;
+            };
+            has_annex_b_declaration = true;
+            let declaration_position = declaration.kind().span().start;
+
+            let block_span = parent.kind().span();
+            if block_span.start <= reference_position && reference_position < block_span.end {
+                return Some(false);
+            }
+            if reference_position < block_span.end {
+                continue;
+            }
+
+            let mut block = parent;
+            loop {
+                let parent = self.nodes.parent_node(block.id());
+                match parent.kind() {
+                    AstKind::BlockStatement(_) => block = parent,
+                    AstKind::LabeledStatement(statement)
+                        if !self.labeled_statement_has_escaping_break_before(
+                            parent.id(),
+                            statement.label.name.as_str(),
+                            declaration_position,
+                        ) =>
+                    {
+                        block = parent;
+                    }
+                    AstKind::FunctionBody(_) => return Some(false),
+                    _ => break,
+                }
+            }
+        }
+
+        has_annex_b_declaration.then_some(true)
+    }
+
+    /// Whether a reference observes an Annex B declaration's lexical binding rather
+    /// than the copied binding in its enclosing function scope.
+    pub fn annex_b_function_uses_lexical_binding_at(
+        &self,
+        symbol_id: SymbolId,
+        reference_position: u32,
+    ) -> bool {
+        self.scoping.symbol_declarations(symbol_id).any(|declaration_id| {
+            let declaration = self.nodes.get_node(declaration_id);
+            let AstKind::Function(function) = declaration.kind() else {
+                return false;
+            };
+            if !self.is_annex_b_function_declaration(symbol_id, function) {
+                return false;
+            }
+
+            let parent = self.nodes.parent_node(declaration.id());
+            match parent.kind() {
+                AstKind::BlockStatement(_) => {
+                    let block_span = parent.kind().span();
+                    block_span.start <= reference_position && reference_position < block_span.end
+                }
+                AstKind::SwitchCase(_) => self.nodes.ancestors(parent.id()).any(|ancestor| {
+                    matches!(ancestor.kind(), AstKind::SwitchStatement(statement)
+                        if statement.discriminant.span().end <= reference_position
+                            && reference_position < statement.span.end)
+                }),
+                _ => false,
+            }
+        })
+    }
+
+    /// Whether a later Annex B declaration can overwrite a captured function-scoped
+    /// binding after the capture's reference position.
+    ///
+    /// A reference inside the declaration's own block observes its lexical binding,
+    /// which is not affected by the outer Annex B assignment. References outside that
+    /// block observe a single live function-scoped binding, even though Oxc represents
+    /// each block declaration with a distinct symbol.
+    pub fn has_annex_b_function_declaration_after(
+        &self,
+        function_scope: ScopeId,
+        name: &str,
+        reference_position: u32,
+    ) -> bool {
+        self.symbols().any(|symbol_id| {
+            self.symbol_name(symbol_id) == name
+                && self
+                    .ancestors(self.symbol_scope(symbol_id))
+                    .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function)
+                    == Some(function_scope)
+                && self.scoping.symbol_declarations(symbol_id).any(|declaration_id| {
+                    let declaration = self.nodes.get_node(declaration_id);
+                    let AstKind::Function(function) = declaration.kind() else {
+                        return false;
+                    };
+                    if declaration.kind().span().start <= reference_position
+                        || !self.is_annex_b_function_declaration(symbol_id, function)
+                    {
+                        return false;
+                    }
+
+                    let mut parent = self.nodes.parent_node(declaration.id());
+                    while matches!(parent.kind(), AstKind::LabeledStatement(_)) {
+                        parent = self.nodes.parent_node(parent.id());
+                    }
+                    match parent.kind() {
+                        AstKind::BlockStatement(_) => {
+                            let block_span = parent.kind().span();
+                            !(block_span.start <= reference_position
+                                && reference_position < block_span.end)
+                        }
+                        AstKind::SwitchCase(_) | AstKind::IfStatement(_) => true,
+                        _ => false,
+                    }
+                })
+        })
+    }
+
+    /// Whether a conditional Annex B declaration can overwrite the function-scoped
+    /// binding before a reference. Such assignments depend on control flow and cannot
+    /// be replaced with one declaration's lexical binding during normalization.
+    pub fn has_conditional_annex_b_function_declaration_before(
+        &self,
+        function_scope: ScopeId,
+        name: &str,
+        reference_position: u32,
+    ) -> bool {
+        self.symbols().any(|symbol_id| {
+            self.symbol_name(symbol_id) == name
+                && self
+                    .ancestors(self.symbol_scope(symbol_id))
+                    .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function)
+                    == Some(function_scope)
+                && self.scoping.symbol_declarations(symbol_id).any(|declaration_id| {
+                    let declaration = self.nodes.get_node(declaration_id);
+                    let AstKind::Function(function) = declaration.kind() else {
+                        return false;
+                    };
+                    if !self.is_annex_b_function_declaration(symbol_id, function) {
+                        return false;
+                    }
+
+                    let declaration_position = declaration.kind().span().start;
+                    if declaration_position >= reference_position
+                        && !self.nodes.ancestors(declaration.id()).any(|ancestor| {
+                            matches!(
+                                ancestor.kind(),
+                                AstKind::ForStatement(_)
+                                    | AstKind::ForInStatement(_)
+                                    | AstKind::ForOfStatement(_)
+                                    | AstKind::WhileStatement(_)
+                                    | AstKind::DoWhileStatement(_)
+                            ) && {
+                                let loop_span = ancestor.kind().span();
+                                loop_span.start <= reference_position
+                                    && reference_position < loop_span.end
+                            }
+                        })
+                    {
+                        return false;
+                    }
+
+                    let mut parent = self.nodes.parent_node(declaration.id());
+                    while matches!(parent.kind(), AstKind::LabeledStatement(_)) {
+                        parent = self.nodes.parent_node(parent.id());
+                    }
+                    match parent.kind() {
+                        AstKind::IfStatement(_) | AstKind::SwitchCase(_) => true,
+                        AstKind::BlockStatement(_) => {
+                            let block_span = parent.kind().span();
+                            if block_span.start <= reference_position
+                                && reference_position < block_span.end
+                            {
+                                return false;
+                            }
+
+                            let mut block = parent;
+                            loop {
+                                let parent = self.nodes.parent_node(block.id());
+                                match parent.kind() {
+                                    AstKind::BlockStatement(_) => block = parent,
+                                    AstKind::LabeledStatement(statement)
+                                        if !self.labeled_statement_has_escaping_break_before(
+                                            parent.id(),
+                                            statement.label.name.as_str(),
+                                            declaration_position,
+                                        ) =>
+                                    {
+                                        block = parent;
+                                    }
+                                    AstKind::FunctionBody(_) => break false,
+                                    _ => break true,
+                                }
+                            }
+                        }
+                        _ => false,
+                    }
+                })
+        })
+    }
+
+    /// Find an Annex B block function whose assignment is guaranteed to have run before
+    /// an unresolved or var-like reference in `function_scope`. A nearer lexical runtime
+    /// binding takes precedence over the recovered function.
+    pub fn visible_annex_b_function(
+        &self,
+        function_scope: ScopeId,
+        name: &str,
+        reference_position: u32,
+        runtime_symbol: Option<SymbolId>,
+    ) -> Option<SymbolId> {
+        if runtime_symbol.is_some_and(|symbol_id| {
+            let nearest_function_scope = self
+                .ancestors(self.symbol_scope(symbol_id))
+                .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function);
+            if nearest_function_scope.is_some_and(|scope_id| self.is_arrow_scope(scope_id)) {
+                return true;
+            }
+            let declared_within_function = self
+                .ancestors(self.symbol_scope(symbol_id))
+                .any(|scope_id| scope_id == function_scope);
+            declared_within_function
+                && !((self.symbol_scope(symbol_id) == function_scope
+                    && (self.binding_kind(symbol_id) == BindingKind::Var
+                        || self.has_body_level_function_declaration(symbol_id)))
+                    || self
+                        .annex_b_function_observes_implicit_arguments_at(
+                            symbol_id,
+                            reference_position,
+                        )
+                        .is_some())
+        }) {
+            return None;
+        }
+
+        let mut visible = None;
+        for symbol_id in self.symbols() {
+            if self.symbol_name(symbol_id) != name
+                || self
+                    .ancestors(self.symbol_scope(symbol_id))
+                    .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function)
+                    != Some(function_scope)
+            {
+                continue;
+            }
+            for declaration_id in self.scoping.symbol_declarations(symbol_id) {
+                let declaration = self.nodes.get_node(declaration_id);
+                let AstKind::Function(function) = declaration.kind() else {
+                    continue;
+                };
+                if !self.is_annex_b_function_declaration(symbol_id, function) {
+                    continue;
+                }
+                let parent = self.nodes.parent_node(declaration.id());
+                let AstKind::BlockStatement(_) = parent.kind() else { continue };
+                let declaration_position = declaration.kind().span().start;
+                let block_span = parent.kind().span();
+                let inside_block =
+                    block_span.start <= reference_position && reference_position < block_span.end;
+                if !inside_block {
+                    if reference_position < block_span.end {
+                        continue;
+                    }
+                    let mut block = parent;
+                    let unconditionally_entered = loop {
+                        let parent = self.nodes.parent_node(block.id());
+                        match parent.kind() {
+                            AstKind::BlockStatement(_) => block = parent,
+                            AstKind::LabeledStatement(statement)
+                                if !self.labeled_statement_has_escaping_break_before(
+                                    parent.id(),
+                                    statement.label.name.as_str(),
+                                    declaration_position,
+                                ) =>
+                            {
+                                block = parent;
+                            }
+                            // A do-while body and a try or finally body are entered before
+                            // a following reference, but HIR currently keeps their block
+                            // function assignments scoped inside those bodies. Keep the
+                            // safe bailout until lowering can preserve the Annex B outer
+                            // assignment.
+                            AstKind::DoWhileStatement(_) | AstKind::TryStatement(_) => break false,
+                            AstKind::FunctionBody(_) => break true,
+                            _ => break false,
+                        }
+                    };
+                    if !unconditionally_entered {
+                        continue;
+                    }
+                }
+
+                // A reference inside nested declaration blocks observes the
+                // innermost lexical binding, even when an enclosing block has a
+                // later declaration. For references after the blocks, execution
+                // order still follows the declaration position.
+                let lexical_depth = if inside_block {
+                    1 + self
+                        .nodes
+                        .ancestors(parent.id())
+                        .take_while(|ancestor| !matches!(ancestor.kind(), AstKind::FunctionBody(_)))
+                        .filter(|ancestor| matches!(ancestor.kind(), AstKind::BlockStatement(_)))
+                        .count()
+                } else {
+                    0
+                };
+                let rank = (inside_block, lexical_depth, declaration_position);
+                if visible.is_none_or(|(best_rank, _)| rank > best_rank) {
+                    visible = Some((rank, symbol_id));
+                }
+            }
+        }
+        visible.map(|(_, symbol_id)| symbol_id)
+    }
+
+    fn is_annex_b_function_declaration(
+        &self,
+        symbol_id: SymbolId,
+        function: &oxc_ast::ast::Function<'_>,
+    ) -> bool {
+        function.is_declaration()
+            && !function.r#async
+            && !function.generator
+            && !self.is_typescript_source
+            && !self.scoping.scope_flags(self.symbol_scope(symbol_id)).is_strict_mode()
     }
 
     /// The symbol's declaration identifier (the first declaration for
@@ -433,6 +887,11 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         self.scoping().root_scope_id()
     }
 
+    /// Whether a function scope belongs to an arrow function.
+    pub fn is_arrow_scope(&self, scope_id: ScopeId) -> bool {
+        self.scoping().scope_flags(scope_id).is_arrow()
+    }
+
     /// Map the scope's flags and creating node to a Babel-style scope kind.
     pub fn scope_kind(&self, scope_id: ScopeId) -> ScopeKind {
         let flags = self.scoping().scope_flags(scope_id);
@@ -491,31 +950,37 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
     ) -> Option<SymbolId> {
         self.ancestors(scope_id).find_map(|scope_id| {
             let symbol_id = self.get_binding(scope_id, name)?;
-            let node = self.nodes.get_node(self.scoping().get_node_id(scope_id));
-            let body_start = match node.kind() {
-                AstKind::Function(function) => function.body.as_ref().map(|body| body.span.start),
-                AstKind::ArrowFunctionExpression(arrow) => arrow.get_expression().map_or_else(
-                    || arrow.get_function_body().map(|body| body.span.start),
-                    |expression| Some(expression.span().start),
-                ),
-                _ => None,
-            };
-            let Some(body_start) = body_start else {
-                return Some(symbol_id);
-            };
-            if position >= body_start {
-                return Some(symbol_id);
-            }
+            self.binding_is_visible_at_position(scope_id, symbol_id, position).then_some(symbol_id)
+        })
+    }
 
-            // Parameters and named function-expression bindings are declared
-            // before the body. Body-level `var` and function declarations are not
-            // visible until parameter initialization has completed.
-            self.scoping
-                .symbol_declarations(symbol_id)
-                .any(|declaration_id| {
-                    self.nodes.get_node(declaration_id).kind().span().start < body_start
-                })
-                .then_some(symbol_id)
+    /// Whether a binding in `scope_id` is visible at `position`, preserving the
+    /// separate parameter and function-body environments used at runtime.
+    pub fn binding_is_visible_at_position(
+        &self,
+        scope_id: ScopeId,
+        symbol_id: SymbolId,
+        position: u32,
+    ) -> bool {
+        let node = self.nodes.get_node(self.scoping().get_node_id(scope_id));
+        let body_start = match node.kind() {
+            AstKind::Function(function) => function.body.as_ref().map(|body| body.span.start),
+            AstKind::ArrowFunctionExpression(arrow) => arrow.get_expression().map_or_else(
+                || arrow.get_function_body().map(|body| body.span.start),
+                |expression| Some(expression.span().start),
+            ),
+            _ => None,
+        };
+        let Some(body_start) = body_start else { return true };
+        if position >= body_start {
+            return true;
+        }
+
+        // Parameters and named function-expression bindings are declared before
+        // the body. Body-level `var` and function declarations are not visible
+        // until parameter initialization has completed.
+        self.scoping.symbol_declarations(symbol_id).any(|declaration_id| {
+            self.nodes.get_node(declaration_id).kind().span().start < body_start
         })
     }
 
@@ -562,6 +1027,14 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
     /// Whether `name` is referenced as a global (unresolved reference) anywhere in the file.
     pub fn has_unresolved_reference(&self, name: &str) -> bool {
         self.scoping().root_unresolved_references().contains_key(name)
+    }
+
+    /// Unresolved semantic references for `name`.
+    pub fn unresolved_reference_ids(&self, name: &str) -> &[ReferenceId] {
+        self.scoping()
+            .root_unresolved_references()
+            .get(name)
+            .map_or(&[], |references| references.as_slice())
     }
 
     /// Bindings declared directly in a scope.

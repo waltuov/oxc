@@ -15,6 +15,7 @@ use crate::scope::SymbolId;
 use rustc_hash::FxHashSet;
 
 use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
+use oxc_ast::ast::IdentifierReference;
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_span::Span;
 use oxc_str::{Ident, format_ident};
@@ -785,6 +786,12 @@ impl<'a, 'b> HirBuilder<'a, 'b> {
         span: Span,
         symbol: Option<SymbolId>,
     ) -> Result<VariableBinding<'a>, OxcDiagnostic> {
+        let symbol = self.scope.resolve_runtime_symbol_at(
+            self.function_scope,
+            name.as_str(),
+            span.start,
+            symbol,
+        );
         let Some(symbol_id) = symbol else {
             // No binding found: this is a global
             return Ok(VariableBinding::Global { name });
@@ -831,6 +838,16 @@ impl<'a, 'b> HirBuilder<'a, 'b> {
         }
     }
 
+    /// Resolve a reference to the runtime symbol used at its source position.
+    pub fn resolve_reference(&self, reference: &IdentifierReference<'_>) -> Option<SymbolId> {
+        self.scope.resolve_runtime_symbol_at(
+            self.function_scope,
+            reference.name.as_str(),
+            reference.span.start,
+            self.scope.resolve_reference(reference),
+        )
+    }
+
     /// Check if an identifier reference resolves to a context identifier.
     ///
     /// A context identifier is a variable declared in an ancestor scope of the
@@ -838,15 +855,15 @@ impl<'a, 'b> HirBuilder<'a, 'b> {
     /// in the function's own scope. These are "captured" variables from an
     /// enclosing function.
     pub fn is_context_identifier(&self, symbol: Option<SymbolId>) -> bool {
-        match symbol {
-            None => false,
-            Some(symbol_id) => {
-                if self.scope.symbol_scope(symbol_id) == self.scope.program_scope() {
-                    return false;
-                }
-                self.context_identifiers.contains(&symbol_id)
-            }
+        let Some(symbol_id) =
+            symbol.and_then(|symbol_id| self.scope.resolve_runtime_value_symbol(symbol_id))
+        else {
+            return false;
+        };
+        if self.scope.symbol_scope(symbol_id) == self.scope.program_scope() {
+            return false;
         }
+        self.context_identifiers.contains(&symbol_id)
     }
 
     /// Like `is_context_identifier`, for callers that already resolved a

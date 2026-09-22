@@ -41,7 +41,7 @@ fn snapshots() {
     insta::glob!(fixtures, "**/*.{js,cjs,mjs,ts,cts,mts,jsx,tsx}", |path| {
         let source = fs::read_to_string(path).unwrap();
         let source = normalize_newlines(&source);
-        let snapshot = run_fixture(&source);
+        let snapshot = run_fixture(path, &source);
         insta::with_settings!({ prepend_module_to_snapshot => false, snapshot_suffix => "", omit_expression => true }, {
             insta::assert_snapshot!(snapshot_name(path), snapshot);
         });
@@ -54,8 +54,8 @@ fn normalize_newlines(source: &str) -> String {
 
 /// Parse, analyse, compile, and render the compiled program + diagnostics, plus any
 /// divergence between the read-only `lint` entry point and `compile`.
-fn run_fixture(source: &str) -> String {
-    let (source_type, options) = parse_pragma(source);
+fn run_fixture(path: &Path, source: &str) -> String {
+    let (source_type, options) = parse_pragma(path, source);
     // In lint output mode the compiler validates without rewriting the program, so
     // `changed` is always false. Upstream's `snap` runner still emits the (unmodified)
     // code in that mode alongside the reported findings, so mirror that here rather
@@ -186,7 +186,7 @@ fn snapshot_name(path: &Path) -> String {
 }
 
 /// Build the per-fixture `SourceType` + `PluginOptions` from the first-line pragmas.
-fn parse_pragma(source: &str) -> (SourceType, PluginOptions) {
+fn parse_pragma(path: &Path, source: &str) -> (SourceType, PluginOptions) {
     // Upstream `snap` defaults: compile everything, surface every error.
     let mut options = PluginOptions {
         compilation_mode: CompilationMode::All,
@@ -256,10 +256,13 @@ fn parse_pragma(source: &str) -> (SourceType, PluginOptions) {
         .unwrap_or("")
         .contains("@validatePreserveExistingMemoizationGuarantees");
 
-    // Upstream parses every (non-Flow) fixture with the TypeScript + JSX plugins,
-    // regardless of extension, and as a module unless `@script` — so injected runtime
-    // imports are `import`, not `require`. Flow fixtures are excluded (no oxc parser).
-    let source_type = if is_script {
+    // Upstream parses every non-Flow fixture with the TypeScript + JSX plugins,
+    // regardless of extension. Script fixtures in this corpus are plain JavaScript,
+    // however, and need JavaScript's Annex B binding semantics. Keep module fixtures
+    // in the permissive TSX mode used by the upstream snap runner.
+    let source_type = if is_script && path.extension().is_some_and(|ext| ext == "js") {
+        SourceType::jsx().with_script(true)
+    } else if is_script {
         SourceType::tsx().with_script(true)
     } else {
         SourceType::tsx().with_module(true)

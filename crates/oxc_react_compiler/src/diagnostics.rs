@@ -1516,6 +1516,15 @@ pub fn unsupported_eval(span: Span) -> OxcDiagnostic {
 }
 
 #[cold]
+pub fn unsupported_implicit_arguments(span: Span) -> OxcDiagnostic {
+    diagnostic(ErrorCategory::UnsupportedSyntax, "Implicit 'arguments' is not supported")
+        .with_help(
+            "React Compiler does not support compiling functions that reference the implicit arguments object",
+        )
+        .with_label(span.primary_label("implicit `arguments` object referenced here"))
+}
+
+#[cold]
 pub fn const_reassignment(
     name: &str,
     reassignment_span: Span,

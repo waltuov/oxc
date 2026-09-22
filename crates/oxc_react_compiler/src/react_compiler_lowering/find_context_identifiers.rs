@@ -38,6 +38,7 @@ use oxc_diagnostics::OxcDiagnostic;
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::scope::ScopeId;
+use crate::scope::ScopeKind;
 use crate::scope::ScopeResolver;
 use crate::scope::SymbolId;
 
@@ -100,26 +101,67 @@ impl<'a> ContextIdentifierVisitor<'a> {
     }
 
     fn check_captured_symbol(&mut self, symbol: Option<SymbolId>) {
-        let symbol_id = match symbol {
-            Some(id) => id,
-            None => return,
+        let Some(symbol_id) =
+            symbol.and_then(|symbol_id| self.scope.resolve_runtime_value_symbol(symbol_id))
+        else {
+            return;
         };
+        let binding_scope = self.scope.symbol_scope(symbol_id);
+        self.check_captured_symbol_in_scope(symbol_id, binding_scope);
+    }
+
+    fn check_captured_symbol_in_scope(&mut self, symbol_id: SymbolId, binding_scope: ScopeId) {
         let &fn_scope = match self.function_stack.last() {
             Some(s) => s,
             None => return,
         };
-        if is_captured_by_function(self.scope, self.scope.symbol_scope(symbol_id), fn_scope) {
+        if is_captured_by_function(self.scope, binding_scope, fn_scope) {
             let info = self.binding_info.entry(symbol_id).or_default();
             info.referenced_by_inner_fn = true;
         }
     }
 
-    fn handle_reassignment_identifier(&mut self, name: &str, current_scope: ScopeId) {
-        if let Some(symbol_id) = self.scope.find_binding(current_scope, name) {
+    fn effective_binding_scope(
+        &self,
+        current_scope: ScopeId,
+        symbol_id: SymbolId,
+        original_runtime_symbol: Option<SymbolId>,
+    ) -> ScopeId {
+        if original_runtime_symbol != Some(symbol_id) {
+            self.scope
+                .ancestors(current_scope)
+                .find(|&scope_id| {
+                    self.scope.scope_kind(scope_id) == ScopeKind::Function
+                        && !self.scope.is_arrow_scope(scope_id)
+                })
+                .unwrap_or_else(|| self.scope.symbol_scope(symbol_id))
+        } else {
+            self.scope.symbol_scope(symbol_id)
+        }
+    }
+
+    fn handle_reassignment_identifier(
+        &mut self,
+        name: &str,
+        current_scope: ScopeId,
+        position: u32,
+    ) {
+        let symbol = self.scope.find_binding(current_scope, name);
+        let runtime_symbol =
+            symbol.and_then(|symbol_id| self.scope.resolve_runtime_value_symbol(symbol_id));
+        if let Some(symbol_id) =
+            self.scope.resolve_runtime_symbol_at(current_scope, name, position, runtime_symbol)
+        {
+            // Annex B block functions also provide a binding in the enclosing
+            // non-arrow function. When position-aware lookup substitutes a
+            // different block symbol, classify captures against that effective
+            // runtime scope rather than the declaration's lexical block.
+            let binding_scope =
+                self.effective_binding_scope(current_scope, symbol_id, runtime_symbol);
             let info = self.binding_info.entry(symbol_id).or_default();
             info.reassigned = true;
             if let Some(&fn_scope) = self.function_stack.last()
-                && is_captured_by_function(self.scope, self.scope.symbol_scope(symbol_id), fn_scope)
+                && is_captured_by_function(self.scope, binding_scope, fn_scope)
             {
                 info.reassigned_by_inner_fn = true;
             }
@@ -203,7 +245,26 @@ impl<'a> VisitJs<'a> for ContextIdentifierVisitor<'a> {
     // ---- identifier references (the captured-reference check) ----
 
     fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
-        self.check_captured_symbol(self.scope.resolve_reference(it));
+        if let Some(function_scope) = self.function_stack.last().copied() {
+            let original_runtime_symbol = self
+                .scope
+                .resolve_reference(it)
+                .and_then(|symbol_id| self.scope.resolve_runtime_value_symbol(symbol_id));
+            let symbol = self.scope.resolve_runtime_symbol_at(
+                function_scope,
+                it.name.as_str(),
+                it.span.start,
+                original_runtime_symbol,
+            );
+            if let Some(symbol_id) = symbol {
+                let binding_scope = self.effective_binding_scope(
+                    function_scope,
+                    symbol_id,
+                    original_runtime_symbol,
+                );
+                self.check_captured_symbol_in_scope(symbol_id, binding_scope);
+            }
+        }
     }
 
     fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
@@ -291,7 +352,7 @@ impl<'a> ContextIdentifierVisitor<'a> {
     ) {
         match target {
             AssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                self.handle_reassignment_identifier(&ident.name, current_scope);
+                self.handle_reassignment_identifier(&ident.name, current_scope, ident.span.start);
             }
             AssignmentTarget::ArrayAssignmentTarget(pat) => {
                 for element in pat.elements.iter().flatten() {
@@ -305,7 +366,11 @@ impl<'a> ContextIdentifierVisitor<'a> {
                 for prop in &pat.properties {
                     match prop {
                         AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
-                            self.handle_reassignment_identifier(&p.binding.name, current_scope);
+                            self.handle_reassignment_identifier(
+                                &p.binding.name,
+                                current_scope,
+                                p.binding.span.start,
+                            );
                         }
                         AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
                             self.walk_maybe_default_for_reassignment(&p.binding, current_scope);
@@ -355,7 +420,7 @@ impl<'a> ContextIdentifierVisitor<'a> {
     ) {
         match expression.get_inner_expression() {
             Expression::Identifier(ident) => {
-                self.handle_reassignment_identifier(&ident.name, current_scope);
+                self.handle_reassignment_identifier(&ident.name, current_scope, ident.span.start);
             }
             Expression::StaticMemberExpression(_)
             | Expression::ComputedMemberExpression(_)
@@ -371,7 +436,7 @@ impl<'a> ContextIdentifierVisitor<'a> {
     ) {
         match target {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                self.handle_reassignment_identifier(&ident.name, current_scope);
+                self.handle_reassignment_identifier(&ident.name, current_scope, ident.span.start);
             }
             SimpleAssignmentTarget::TSAsExpression(node) => {
                 self.walk_assignment_target_expression_for_reassignment(

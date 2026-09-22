@@ -1,0 +1,21 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/valid-explicit-arguments-annex-b-labeled-block.js
+---
+const { c: _c } = require("react/compiler-runtime");
+// @script
+function Component(x) {
+	const $ = _c(2);
+	let t0;
+	if ($[0] !== x) {
+		function arguments(v) {
+			return v;
+		}
+		t0 = arguments(x);
+		$[0] = x;
+		$[1] = t0;
+	} else {
+		t0 = $[1];
+	}
+	return t0;
+}

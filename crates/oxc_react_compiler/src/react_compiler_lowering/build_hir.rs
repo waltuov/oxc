@@ -9,6 +9,7 @@ use crate::react_compiler_hir::*;
 use crate::react_compiler_utils::{FxIndexMap, FxIndexSet, IdentIndexMap};
 use crate::scope::BindingKind as AstBindingKind;
 use crate::scope::DeclKind;
+use crate::scope::ReferenceId;
 use crate::scope::ScopeId;
 use crate::scope::ScopeKind;
 use crate::scope::ScopeResolver;
@@ -659,6 +660,7 @@ fn lower_inner<'a>(
     // Function declarations resolve through their enclosing scope and continue
     // to use the normal local/context lowering paths.
     let self_binding = if let Some(name) = id
+        && name != "arguments"
         && let Some(symbol_id) = scope.get_binding(function_scope, name.as_str())
         && scope.decl_kind(symbol_id) == DeclKind::FunctionExpression
         && !scope.reference_ids(symbol_id).is_empty()
@@ -855,6 +857,94 @@ fn lower_inner<'a>(
 // lower_identifier
 // =============================================================================
 
+fn record_unsupported_implicit_arguments(
+    builder: &mut HirBuilder<'_, '_>,
+    name: Ident<'_>,
+    binding: VariableBinding<'_>,
+    symbol: Option<SymbolId>,
+    span: Span,
+) -> Result<bool, OxcDiagnostic> {
+    if name != "arguments" {
+        return Ok(false);
+    }
+
+    let scope = builder.scope();
+    let Some(arguments_scope) = scope.ancestors(builder.function_scope()).find(|&scope_id| {
+        scope.scope_kind(scope_id) == ScopeKind::Function && !scope.is_arrow_scope(scope_id)
+    }) else {
+        // Arrows do not create an implicit arguments object. Without an enclosing
+        // non-arrow function, an unresolved `arguments` is a normal global lookup.
+        return Ok(false);
+    };
+    let runtime_symbol = symbol.and_then(|symbol_id| scope.resolve_runtime_value_symbol(symbol_id));
+    let hidden_by_parameter_environment = runtime_symbol.is_some_and(|symbol_id| {
+        scope.symbol_scope(symbol_id) == arguments_scope
+            && !scope.binding_is_visible_at_position(arguments_scope, symbol_id, span.start)
+    });
+    let runtime_symbol = runtime_symbol.filter(|_| !hidden_by_parameter_environment);
+    let symbol = scope
+        .visible_annex_b_function(arguments_scope, name.as_str(), span.start, runtime_symbol)
+        .or(runtime_symbol);
+
+    let is_implicit_arguments = match symbol {
+        None => {
+            hidden_by_parameter_environment || matches!(binding, VariableBinding::Global { .. })
+        }
+        Some(symbol_id) => {
+            let symbol_scope = scope.symbol_scope(symbol_id);
+            let declared_within_arguments_scope =
+                scope.ancestors(symbol_scope).any(|scope_id| scope_id == arguments_scope);
+            let annex_b_binding =
+                scope.annex_b_function_observes_implicit_arguments_at(symbol_id, span.start);
+            let binding_kind = scope.binding_kind(symbol_id);
+            let has_body_level_function = scope.has_body_level_function_declaration(symbol_id);
+            let is_implicit_var_binding = binding_kind == AstBindingKind::Var
+                && !has_body_level_function
+                && annex_b_binding != Some(false);
+            let annex_b_overwritable_function_binding = symbol_scope == arguments_scope
+                && (binding_kind == AstBindingKind::Var || has_body_level_function);
+            let conditional_annex_b_may_overwrite_binding = annex_b_overwritable_function_binding
+                && !scope.annex_b_function_uses_lexical_binding_at(symbol_id, span.start)
+                && scope.has_conditional_annex_b_function_declaration_before(
+                    arguments_scope,
+                    name.as_str(),
+                    span.start,
+                );
+            let captured_annex_b_binding_may_be_overwritten = builder.function_scope()
+                != arguments_scope
+                && ((annex_b_binding.is_some()
+                    && !scope.annex_b_function_uses_lexical_binding_at(symbol_id, span.start))
+                    || annex_b_overwritable_function_binding)
+                && scope.has_annex_b_function_declaration_after(
+                    arguments_scope,
+                    name.as_str(),
+                    span.start,
+                );
+
+            // Oxc may resolve through the nearest non-arrow function to an outer symbol.
+            // An `arguments` symbol for that function's `var`, TypeScript enum,
+            // function-expression self-name, or an Annex B function outside its
+            // declaration block also loses to the implicit object.
+            !declared_within_arguments_scope
+                || (symbol_scope == arguments_scope
+                    && (is_implicit_var_binding
+                        || matches!(
+                            scope.decl_kind(symbol_id),
+                            DeclKind::FunctionExpression | DeclKind::TSEnumDeclaration
+                        )
+                        || annex_b_binding == Some(true)))
+                || conditional_annex_b_may_overwrite_binding
+                || captured_annex_b_binding_may_be_overwritten
+        }
+    };
+
+    if is_implicit_arguments {
+        builder.record_error(diagnostics::unsupported_implicit_arguments(span))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Resolve an identifier to a Place. Local/context identifiers return a Place
 /// referencing the binding; globals/imports emit a LoadGlobal. AST-agnostic.
 fn lower_identifier<'a>(
@@ -864,13 +954,22 @@ fn lower_identifier<'a>(
     symbol: Option<SymbolId>,
 ) -> Result<Place, OxcDiagnostic> {
     let binding = builder.resolve_identifier(name, span, symbol)?;
+    if record_unsupported_implicit_arguments(builder, name, binding, symbol, span)? {
+        return lower_value_to_temporary(
+            builder,
+            InstructionValue::LoadGlobal {
+                binding: NonLocalBinding::Global { name },
+                span: Some(span),
+            },
+        );
+    }
     match binding {
         VariableBinding::Identifier { identifier, .. } => {
             Ok(Place { identifier, effect: Effect::Unknown, reactive: false, span: Some(span) })
         }
         _ => {
-            if let VariableBinding::Global { name } = binding
-                && name == "eval"
+            if let VariableBinding::Global { name } = &binding
+                && *name == "eval"
             {
                 builder.record_error(diagnostics::unsupported_eval(span))?;
             }
@@ -1242,6 +1341,9 @@ fn lower_identifier_for_assignment<'a>(
         );
         let identifier = builder.resolve_binding_with_span(name, symbol_id, Some(ident_span))?;
         binding = VariableBinding::Identifier { identifier, binding_kind: bk };
+    }
+    if record_unsupported_implicit_arguments(builder, name, binding, symbol, ident_span)? {
+        return Ok(None);
     }
     match binding {
         VariableBinding::Identifier { identifier, binding_kind, .. } => {
@@ -1789,7 +1891,7 @@ fn lower_identifier_assignment_target<'a>(
         id.span,
         kind,
         id.name,
-        builder.scope().resolve_reference(id),
+        builder.resolve_reference(id),
     )?;
     match result {
         None => Ok(None),
@@ -1801,9 +1903,8 @@ fn lower_identifier_assignment_target<'a>(
             Ok(Some(temp))
         }
         Some(IdentifierForAssignment::Place(place)) => {
-            if builder.is_context_identifier(builder.scope().resolve_reference(id)) {
+            if builder.is_context_identifier(builder.resolve_reference(id)) {
                 let is_hoisted = builder
-                    .scope()
                     .resolve_reference(id)
                     .map(|s| builder.environment().is_hoisted_identifier(s))
                     .unwrap_or(false);
@@ -1924,10 +2025,10 @@ fn assignment_target_is_local_identifier<'a>(
 ) -> Result<bool, OxcDiagnostic> {
     match maybe {
         oxc::AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(id) => {
-            if builder.is_context_identifier(builder.scope().resolve_reference(id)) {
+            if builder.is_context_identifier(builder.resolve_reference(id)) {
                 return Ok(false);
             }
-            let symbol = builder.scope().resolve_reference(id);
+            let symbol = builder.resolve_reference(id);
             match builder.resolve_identifier(id.name, id.span, symbol)? {
                 VariableBinding::Identifier { .. } => Ok(true),
                 _ => Ok(false),
@@ -2075,7 +2176,7 @@ fn lower_assignment_target<'a>(
                     }
                     Some(oxc::AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(id)) => {
                         let is_context =
-                            builder.is_context_identifier(builder.scope().resolve_reference(id));
+                            builder.is_context_identifier(builder.resolve_reference(id));
                         let can_use_direct = !force_temporaries
                             && (matches!(assignment_style, AssignmentStyle::Assignment)
                                 || !is_context);
@@ -2086,7 +2187,7 @@ fn lower_assignment_target<'a>(
                                 id.span,
                                 kind,
                                 id.name,
-                                builder.scope().resolve_reference(id),
+                                builder.resolve_reference(id),
                             )? {
                                 Some(IdentifierForAssignment::Place(place)) => {
                                     items.push(ArrayPatternElement::Place(place));
@@ -2127,7 +2228,7 @@ fn lower_assignment_target<'a>(
                 match &rest.target {
                     oxc::AssignmentTarget::AssignmentTargetIdentifier(id) => {
                         let is_context =
-                            builder.is_context_identifier(builder.scope().resolve_reference(id));
+                            builder.is_context_identifier(builder.resolve_reference(id));
                         let can_use_direct = !force_temporaries
                             && (matches!(assignment_style, AssignmentStyle::Assignment)
                                 || !is_context);
@@ -2138,7 +2239,7 @@ fn lower_assignment_target<'a>(
                                 id.span,
                                 kind,
                                 id.name,
-                                builder.scope().resolve_reference(id),
+                                builder.resolve_reference(id),
                             )? {
                                 Some(IdentifierForAssignment::Place(place)) => {
                                     items.push(ArrayPatternElement::Spread(SpreadPattern {
@@ -2218,7 +2319,7 @@ fn lower_assignment_target<'a>(
                                     found = true;
                                     break;
                                 }
-                                let symbol = builder.scope().resolve_reference(&p.binding);
+                                let symbol = builder.resolve_reference(&p.binding);
                                 match builder.resolve_identifier(
                                     p.binding.name,
                                     p.binding.span,
@@ -2274,7 +2375,7 @@ fn lower_assignment_target<'a>(
                             continue;
                         }
                         let is_context =
-                            builder.is_context_identifier(builder.scope().resolve_reference(id));
+                            builder.is_context_identifier(builder.resolve_reference(id));
                         let can_use_direct = !force_temporaries
                             && (matches!(assignment_style, AssignmentStyle::Assignment)
                                 || !is_context);
@@ -2285,7 +2386,7 @@ fn lower_assignment_target<'a>(
                                 id.span,
                                 kind,
                                 id.name,
-                                builder.scope().resolve_reference(id),
+                                builder.resolve_reference(id),
                             )? {
                                 Some(IdentifierForAssignment::Place(place)) => {
                                     properties.push(ObjectPropertyOrSpread::Property(
@@ -2329,8 +2430,8 @@ fn lower_assignment_target<'a>(
                         };
                         match &p.binding {
                             oxc::AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(id) => {
-                                let is_context = builder
-                                    .is_context_identifier(builder.scope().resolve_reference(id));
+                                let is_context =
+                                    builder.is_context_identifier(builder.resolve_reference(id));
                                 let can_use_direct = !force_temporaries
                                     && (matches!(assignment_style, AssignmentStyle::Assignment)
                                         || !is_context);
@@ -2341,7 +2442,7 @@ fn lower_assignment_target<'a>(
                                         id.span,
                                         kind,
                                         id.name,
-                                        builder.scope().resolve_reference(id),
+                                        builder.resolve_reference(id),
                                     )? {
                                         Some(IdentifierForAssignment::Place(place)) => {
                                             properties.push(ObjectPropertyOrSpread::Property(
@@ -2394,7 +2495,7 @@ fn lower_assignment_target<'a>(
                 match &rest.target {
                     oxc::AssignmentTarget::AssignmentTargetIdentifier(id) => {
                         let is_context =
-                            builder.is_context_identifier(builder.scope().resolve_reference(id));
+                            builder.is_context_identifier(builder.resolve_reference(id));
                         let can_use_direct = !force_temporaries
                             && (matches!(assignment_style, AssignmentStyle::Assignment)
                                 || !is_context);
@@ -2405,7 +2506,7 @@ fn lower_assignment_target<'a>(
                                 id.span,
                                 kind,
                                 id.name,
-                                builder.scope().resolve_reference(id),
+                                builder.resolve_reference(id),
                             )? {
                                 Some(IdentifierForAssignment::Place(place)) => {
                                     properties.push(ObjectPropertyOrSpread::Spread(
@@ -2519,7 +2620,7 @@ fn lower_identifier_followup_store<'a>(
         id.span,
         kind,
         id.name,
-        builder.scope().resolve_reference(id),
+        builder.resolve_reference(id),
     )?;
     match result {
         None => Ok(None),
@@ -2531,7 +2632,7 @@ fn lower_identifier_followup_store<'a>(
             Ok(Some(t))
         }
         Some(IdentifierForAssignment::Place(place)) => {
-            if builder.is_context_identifier(builder.scope().resolve_reference(id)) {
+            if builder.is_context_identifier(builder.resolve_reference(id)) {
                 let t = lower_value_to_temporary(
                     builder,
                     InstructionValue::StoreContext {
@@ -3267,7 +3368,19 @@ fn lower_function_declaration<'a>(
         && let Some(id_node) = &func_decl.id
     {
         let ident_span = id_node.span;
-        let scope_binding = builder.get_function_declaration_binding(function_scope, name.as_str());
+        // A sloppy-mode block function inside an arrow owns an arrow-local Annex B
+        // binding. HIR name collision handling may rename that symbol, but the store
+        // must still target the declaration's semantic binding instead of falling
+        // through to a same-named binding in the enclosing non-arrow function.
+        let scope = builder.scope();
+        let arrow_local_binding = scope.resolve_binding_identifier(id_node).filter(|&symbol_id| {
+            scope
+                .ancestors(scope.symbol_scope(symbol_id))
+                .find(|&scope_id| scope.scope_kind(scope_id) == ScopeKind::Function)
+                .is_some_and(|scope_id| scope.is_arrow_scope(scope_id))
+        });
+        let scope_binding = arrow_local_binding
+            .or_else(|| builder.get_function_declaration_binding(function_scope, name.as_str()));
         let mut is_context = false;
         let binding = match scope_binding {
             Some(symbol_id) => {
@@ -3435,34 +3548,50 @@ fn gather_captured_context(
         (u32, Option<Span>), // (min_position, span)
     > = rustc_hash::FxHashMap::default();
 
-    for symbol_id in scope.symbols() {
-        // Inline enums are opaque pass-through nodes, matching upstream's
-        // `UnsupportedNode`, so their bindings are not context operands.
-        if matches!(
-            scope.decl_kind(symbol_id),
-            DeclKind::TSTypeAliasDeclaration | DeclKind::TSEnumDeclaration
-        ) {
-            continue;
-        }
-        if !pure_scopes.contains(&scope.symbol_scope(symbol_id)) {
-            continue;
-        }
-        let declaration_start = scope.declaration_ident(symbol_id).map(|id| id.span.start);
-        for &ref_id in scope.reference_ids(symbol_id) {
+    let mut record_reference =
+        |name: &str, runtime_symbol: Option<SymbolId>, ref_id: ReferenceId| {
             // Only references the identifier walk recorded participate; the walk
             // covers exactly the compiled function's subtree.
-            let Some(entry) = identifier_spans.reference(ref_id) else { continue };
+            let Some(entry) = identifier_spans.reference(ref_id) else { return };
             let ref_start = entry.span.start;
             // Skip type-annotation references: TS's gatherCapturedContext traverse
             // skips TypeAnnotation/TSTypeAnnotation/TypeAlias/TSTypeAliasDeclaration
             // subtrees, so identifiers there never become captures (they DO still
             // feed FindContextIdentifiers and the hoisting analysis, which have no
             // such skip in TS).
-            if entry.in_type_annotation {
-                continue;
+            if entry.in_type_annotation
+                || !scope.node_within(scope.reference_node_id(ref_id), root_node)
+            {
+                return;
             }
-            if !scope.node_within(scope.reference_node_id(ref_id), root_node) {
-                continue;
+            let Some(symbol_id) =
+                scope.resolve_runtime_symbol_at(function_scope, name, ref_start, runtime_symbol)
+            else {
+                return;
+            };
+            // Inline enums are opaque pass-through nodes, matching upstream's
+            // `UnsupportedNode`, so their bindings are not context operands.
+            let symbol_scope = scope.symbol_scope(symbol_id);
+            // An Annex B function is lexically block-scoped in Oxc, but its
+            // recovered runtime binding belongs to the enclosing function. Use
+            // that function scope when deciding whether a nested function captures it.
+            let capture_scope = if scope
+                .annex_b_function_observes_implicit_arguments_at(symbol_id, ref_start)
+                .is_some()
+            {
+                scope
+                    .ancestors(symbol_scope)
+                    .find(|&scope_id| scope.scope_kind(scope_id) == ScopeKind::Function)
+                    .unwrap_or(symbol_scope)
+            } else {
+                symbol_scope
+            };
+            if matches!(
+                scope.decl_kind(symbol_id),
+                DeclKind::TSTypeAliasDeclaration | DeclKind::TSEnumDeclaration
+            ) || !pure_scopes.contains(&capture_scope)
+            {
+                return;
             }
             // Skip references whose start offset aliases the binding's own
             // declaration offset. Hermes desugars (component syntax) reuse the
@@ -3472,8 +3601,8 @@ fn gather_captured_context(
             // function's position range and alias the declaration position. In
             // real source a non-declaration reference can never share its
             // declaration's offset, so this only filters desugared aliases.
-            if declaration_start == Some(ref_start) {
-                continue;
+            if scope.declaration_ident(symbol_id).map(|id| id.span.start) == Some(ref_start) {
+                return;
             }
             let span = Some(entry.opening_element_span.unwrap_or(entry.span));
             captured
@@ -3485,7 +3614,25 @@ fn gather_captured_context(
                     }
                 })
                 .or_insert((ref_start, span));
+        };
+
+    for original_symbol_id in scope.symbols() {
+        // Oxc may attach a value-position reference to an erased type-only
+        // declaration. Runtime lookup skips that declaration, but its references
+        // remain stored on the original semantic symbol.
+        let Some(runtime_symbol) = scope.resolve_runtime_value_symbol(original_symbol_id) else {
+            continue;
+        };
+        for &ref_id in scope.reference_ids(original_symbol_id) {
+            record_reference(scope.symbol_name(runtime_symbol), Some(runtime_symbol), ref_id);
         }
+    }
+
+    // Annex B recovery can turn an unresolved semantic `arguments` reference into
+    // a local runtime binding. Those references are absent from every symbol's
+    // resolved-reference list, so include them explicitly.
+    for &ref_id in scope.unresolved_reference_ids("arguments") {
+        record_reference("arguments", None, ref_id);
     }
 
     // Sort captured entries by source position so context declarations appear
@@ -3560,7 +3707,7 @@ fn lower_expression<'a>(
     match expr {
         oxc::Expression::Identifier(ident) => {
             let span = Some(ident.span);
-            let symbol = builder.scope().resolve_reference(ident);
+            let symbol = builder.resolve_reference(ident);
             let place = lower_identifier(builder, ident.name, ident.span, symbol)?;
             if builder.is_context_identifier(symbol) {
                 Ok(InstructionValue::LoadContext {
@@ -4083,11 +4230,19 @@ fn lower_expression<'a>(
                     Ok(InstructionValue::LoadLocal { place: result_place, span: result_place.span })
                 }
                 Some(SimpleAssignmentTargetRef::Identifier(ident)) => {
-                    let symbol = builder.scope().resolve_reference(ident);
+                    let symbol = builder.resolve_reference(ident);
                     let is_context = builder.is_context_identifier(symbol);
 
                     let ident_span = ident.span;
                     let binding = builder.resolve_identifier(ident.name, ident_span, symbol)?;
+                    if record_unsupported_implicit_arguments(
+                        builder, ident.name, binding, symbol, ident_span,
+                    )? {
+                        return Ok(InstructionValue::Primitive {
+                            value: PrimitiveValue::Undefined,
+                            span,
+                        });
+                    }
                     if matches!(binding, VariableBinding::Global { .. }) {
                         builder.record_error(
                             diagnostics::todo_update_expression_where_argument_global_not_yet_supported(span),
@@ -4121,7 +4276,7 @@ fn lower_expression<'a>(
                         builder,
                         ident.name,
                         ident_span,
-                        builder.scope().resolve_reference(ident),
+                        builder.resolve_reference(ident),
                     )?;
 
                     let operation = update.operator;
@@ -4383,10 +4538,18 @@ fn lower_assignment_expression<'a>(
         }
         match &assign.left {
             oxc::AssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                let symbol = builder.scope().resolve_reference(ident);
+                let symbol = builder.resolve_reference(ident);
                 let right = lower_expression_to_temporary(builder, &assign.right)?;
                 let ident_span = ident.span;
                 let binding = builder.resolve_identifier(ident.name, ident_span, symbol)?;
+                if record_unsupported_implicit_arguments(
+                    builder, ident.name, binding, symbol, ident_span,
+                )? {
+                    return Ok(InstructionValue::Primitive {
+                        value: PrimitiveValue::Undefined,
+                        span: Some(ident_span),
+                    });
+                }
                 match binding {
                     VariableBinding::Identifier { identifier, binding_kind } => {
                         if binding_kind == BindingKind::Const {
@@ -4494,7 +4657,7 @@ fn lower_assignment_expression<'a>(
         match simple_assignment_target_ref(&assign.left) {
             Some(SimpleAssignmentTargetRef::Identifier(ident)) => {
                 let ident_span = ident.span;
-                let symbol = builder.scope().resolve_reference(ident);
+                let symbol = builder.resolve_reference(ident);
                 let left_place = lower_identifier(builder, ident.name, ident_span, symbol)?;
                 let is_context_identifier = builder.is_context_identifier(symbol);
                 let left_place = lower_value_to_temporary(
@@ -4872,7 +5035,7 @@ fn lower_jsx_element_name<'a>(
             lower_tag_identifier(builder, Ident::from(id.name.as_str()), id.span, None, false)
         }
         oxc::JSXElementName::IdentifierReference(id) => {
-            let symbol = builder.scope().resolve_reference(id);
+            let symbol = builder.resolve_reference(id);
             lower_tag_identifier(builder, id.name, id.span, symbol, true)
         }
         oxc::JSXElementName::ThisExpression(this) => {
@@ -4918,7 +5081,7 @@ fn lower_jsx_member_expression<'a>(
     let expr_span = Some(expr.span);
     let object = match &expr.object {
         oxc::JSXMemberExpressionObject::IdentifierReference(id) => {
-            let symbol = builder.scope().resolve_reference(id);
+            let symbol = builder.resolve_reference(id);
             lower_jsx_member_object_identifier(builder, id.name, id.span, symbol, &expr_span)?
         }
         oxc::JSXMemberExpressionObject::ThisExpression(this) => lower_jsx_member_object_identifier(
@@ -5659,7 +5822,7 @@ fn is_reorderable_expression(
 ) -> bool {
     match expr {
         oxc::Expression::Identifier(ident) => {
-            match builder.scope().resolve_reference(ident) {
+            match builder.resolve_reference(ident) {
                 None => {
                     // global, safe to reorder
                     true
@@ -5730,7 +5893,7 @@ fn is_reorderable_expression(
                 };
             }
             if let oxc::Expression::Identifier(ident) = inner {
-                match builder.scope().resolve_reference(ident) {
+                match builder.resolve_reference(ident) {
                     None => true, // global
                     Some(symbol_id) => {
                         // Module-scope bindings (ModuleLocal, imports) and inline enum

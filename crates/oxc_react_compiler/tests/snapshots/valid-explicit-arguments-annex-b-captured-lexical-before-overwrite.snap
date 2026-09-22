@@ -1,0 +1,35 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/valid-explicit-arguments-annex-b-captured-lexical-before-overwrite.js
+---
+const { c: _c } = require("react/compiler-runtime");
+// @script
+function Component() {
+	const $ = _c(3);
+	let read;
+	let t0;
+	if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
+		function arguments() {
+			return "first";
+		}
+		read = () => arguments();
+		t0 = read();
+		$[0] = t0;
+		$[1] = read;
+	} else {
+		t0 = $[0];
+		read = $[1];
+	}
+	let t1;
+	if ($[2] === Symbol.for("react.memo_cache_sentinel")) {
+		t1 = <div>{t0}</div>;
+		$[2] = t1;
+	} else {
+		t1 = $[2];
+	}
+	return t1;
+}
+export const FIXTURE_ENTRYPOINT = {
+	fn: Component,
+	params: []
+};
