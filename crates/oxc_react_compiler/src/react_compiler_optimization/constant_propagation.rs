@@ -740,7 +740,7 @@ fn evaluate_binary_op<'a>(
         },
         BinaryOperator::Exponential => match (lhs, rhs) {
             (PrimitiveValue::Number(l), PrimitiveValue::Number(r)) => {
-                Some(PrimitiveValue::Number(FloatValue::new(l.value().powf(r.value()))))
+                Some(PrimitiveValue::Number(FloatValue::new(js_exponentiate(l.value(), r.value()))))
             }
             _ => None,
         },
@@ -818,6 +818,15 @@ fn evaluate_binary_op<'a>(
         BinaryOperator::Inequality => Some(PrimitiveValue::Boolean(!js_abstract_equal(lhs, rhs))),
         BinaryOperator::In | BinaryOperator::Instanceof => None,
     }
+}
+
+/// ECMAScript Number::exponentiate (`**`). `f64::powf` follows IEEE 754, which
+/// returns 1 for `1 ** NaN` and `(±1) ** ±Infinity`; JavaScript returns NaN.
+fn js_exponentiate(base: f64, exponent: f64) -> f64 {
+    if base.abs() == 1.0 && !exponent.is_finite() {
+        return f64::NAN;
+    }
+    base.powf(exponent)
 }
 
 // =============================================================================
