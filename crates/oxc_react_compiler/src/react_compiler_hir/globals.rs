@@ -486,6 +486,7 @@ const BUILTIN_SHAPE_DEFS: &[ShapeDef] = &[
                     callee_effect: Effect::Store,
                     return_type: TypeDef::Primitive,
                     return_value_kind: ValueKind::Primitive,
+                    canonical_name: Some("Array.push"),
                     aliasing: Some(&AliasingSignatureConfig {
                         receiver: "@receiver",
                         params: &[],
@@ -1764,7 +1765,36 @@ fn build_typed_globals(
 
     // Object, Array, Math, performance, Date, console
     for def in TYPED_GLOBAL_OBJECTS {
-        let global = add_object_from_def(shapes, Some(Ident::from(def.name)), def.props);
+        let id = Ident::from(def.name);
+        let global = if def.name == "Date" {
+            let properties = def
+                .props
+                .iter()
+                .map(|prop| match prop {
+                    Method(name, method) => {
+                        (Ident::from(*name), add_method(shapes, method, None, false))
+                    }
+                    Value(name, ty) => (Ident::from(*name), ty.as_type()),
+                })
+                .collect();
+            add_function(
+                shapes,
+                properties,
+                FunctionSignatureBuilder {
+                    rest_param: Some(Effect::Read),
+                    return_type: Type::Poly,
+                    return_value_kind: ValueKind::Mutable,
+                    impure: true,
+                    impure_if_no_args: true,
+                    canonical_name: Some(Cow::Borrowed("Date")),
+                    ..Default::default()
+                },
+                Some(id),
+                false,
+            )
+        } else {
+            add_object_from_def(shapes, Some(id), def.props)
+        };
         typed_globals.push((Ident::from(def.name), global.clone()));
         globals.insert(Ident::from(def.name), global);
     }

@@ -1507,6 +1507,8 @@ pub enum AliasingEffect<'a> {
         receiver: Place,
         function: Place,
         mutates_function: bool,
+        /// Whether the originating expression invokes a function rather than constructs it.
+        is_function_call: bool,
         args: ArenaVec<'a, PlaceOrSpreadOrHole>,
         into: Place,
         /// Callee function `TypeId`, used to resolve the `FunctionSignature` from the
@@ -2235,6 +2237,7 @@ impl<'a> CloneIn<'a> for AliasingEffect<'a> {
                 receiver,
                 function,
                 mutates_function,
+                is_function_call,
                 args,
                 into,
                 signature,
@@ -2243,6 +2246,7 @@ impl<'a> CloneIn<'a> for AliasingEffect<'a> {
                 receiver: *receiver,
                 function: *function,
                 mutates_function: *mutates_function,
+                is_function_call: *is_function_call,
                 args: args.clone_in_impl(sem, alloc),
                 into: *into,
                 signature: *signature,

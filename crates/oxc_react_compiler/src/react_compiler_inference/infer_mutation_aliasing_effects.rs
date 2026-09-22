@@ -177,6 +177,7 @@ pub fn infer_mutation_aliasing_effects<'a>(
 
     let hoisted_context_declarations = find_hoisted_context_declarations(func, env);
     let non_mutating_spreads = find_non_mutated_destructure_spreads(func, env);
+    let nonempty_array_literals = find_nonempty_array_literals(func);
 
     let mut context = Context {
         alloc: env.allocator,
@@ -185,6 +186,8 @@ pub fn infer_mutation_aliasing_effects<'a>(
         is_function_expression,
         hoisted_context_declarations,
         non_mutating_spreads,
+        nonempty_array_literals,
+        nonempty_array_values: FxHashSet::default(),
         effect_value_id_cache: FxHashMap::default(),
         function_values: FxHashMap::default(),
         function_signature_cache: FxHashMap::default(),
@@ -772,6 +775,11 @@ struct Context<'a> {
     is_function_expression: bool,
     hoisted_context_declarations: FxHashMap<DeclarationId, Option<Place>>,
     non_mutating_spreads: FxHashSet<IdentifierId>,
+    /// Array literal temporaries that are guaranteed to contain at least one element.
+    nonempty_array_literals: FxHashSet<IdentifierId>,
+    /// Allocation values for guaranteed-nonempty array literals. Tracking the
+    /// allocation lets the fact survive local stores, loads, and phi aliases.
+    nonempty_array_values: FxHashSet<ValueId>,
     /// Cache of ValueIds keyed by effect key, ensuring stable allocation-site identity
     /// across fixpoint iterations. Mirrors TS `effectInstructionValueCache`.
     effect_value_id_cache: FxHashMap<EffectKey, ValueId>,
@@ -813,6 +821,7 @@ enum EffectKey {
         receiver: IdentifierId,
         function: IdentifierId,
         mutates_function: bool,
+        is_function_call: bool,
         args: SmallVec<[ArgKey; 4]>,
         into: IdentifierId,
     },
@@ -902,7 +911,15 @@ enum ArgKey {
 
 fn effect_key(effect: &AliasingEffect) -> EffectKey {
     match effect {
-        AliasingEffect::Apply { receiver, function, mutates_function, args, into, .. } => {
+        AliasingEffect::Apply {
+            receiver,
+            function,
+            mutates_function,
+            is_function_call,
+            args,
+            into,
+            ..
+        } => {
             let mut key_args: SmallVec<[ArgKey; 4]> = args
                 .iter()
                 .map(|a| match a {
@@ -920,6 +937,7 @@ fn effect_key(effect: &AliasingEffect) -> EffectKey {
                 receiver: receiver.identifier,
                 function: function.identifier,
                 mutates_function: *mutates_function,
+                is_function_call: *is_function_call,
                 args: key_args,
                 into: into.identifier,
             }
@@ -1187,6 +1205,30 @@ fn find_non_mutated_destructure_spreads(
         }
     }
     non_mutating
+}
+
+fn find_nonempty_array_literals(func: &HirFunction) -> FxHashSet<IdentifierId> {
+    let mut nonempty = FxHashSet::default();
+    loop {
+        let mut changed = false;
+        for (_, block) in &func.body.blocks {
+            for &instruction_id in &block.instructions {
+                let instruction = &func.instructions[instruction_id.index()];
+                if let InstructionValue::ArrayExpression { elements, .. } = &instruction.value
+                    && elements.iter().any(|element| match element {
+                        ArrayElement::Spread(spread) => nonempty.contains(&spread.place.identifier),
+                        _ => true,
+                    })
+                {
+                    changed |= nonempty.insert(instruction.lvalue.identifier);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    nonempty
 }
 
 // =============================================================================
@@ -1565,6 +1607,9 @@ fn apply_effect_ref<'a>(
             );
             initialized.insert(into.identifier);
             let value_id = context.get_or_create_value_id(effect);
+            if context.nonempty_array_literals.contains(&into.identifier) {
+                context.nonempty_array_values.insert(value_id);
+            }
             state.initialize(
                 value_id,
                 AbstractValue { kind: *kind, reason: ReasonSet::single(*reason) },
@@ -1818,6 +1863,7 @@ fn apply_effect_ref<'a>(
             receiver,
             function,
             mutates_function,
+            is_function_call,
             args,
             into,
             signature,
@@ -1883,6 +1929,29 @@ fn apply_effect_ref<'a>(
                 env.get_function_signature(ty).ok().flatten().cloned()
             });
             if let Some(sig) = &sig_owned {
+                let preserved_nonempty_receiver_values =
+                    if sig.canonical_name.as_deref() == Some("Array.push") {
+                        let adds_element = args.iter().any(|arg| match arg {
+                            PlaceOrSpreadOrHole::Place(_) => true,
+                            PlaceOrSpreadOrHole::Hole => false,
+                            PlaceOrSpreadOrHole::Spread(spread) => {
+                                let values = state.values_for(spread.place.identifier);
+                                !values.is_empty()
+                                    && values.iter().all(|value_id| {
+                                        context.nonempty_array_values.contains(value_id)
+                                    })
+                            }
+                        });
+                        state
+                            .values_for(receiver.identifier)
+                            .into_iter()
+                            .filter(|value_id| {
+                                adds_element || context.nonempty_array_values.contains(value_id)
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
                 // Check known_incompatible (TS line 2351-2370)
                 if let Some(ref incompatible_msg) = sig.known_incompatible
                     && env.enable_validations()
@@ -1908,6 +1977,7 @@ fn apply_effect_ref<'a>(
                         for se in sig_effs {
                             apply_effect(context, state, se, initialized, effects, env)?;
                         }
+                        context.nonempty_array_values.extend(preserved_nonempty_receiver_values);
                         return Ok(());
                     }
                 }
@@ -1919,10 +1989,12 @@ fn apply_effect_ref<'a>(
                     sig,
                     into,
                     receiver,
+                    *is_function_call,
                     args,
                     span.as_ref(),
                     env,
                     &context.function_values,
+                    &context.nonempty_array_values,
                     &mut todo_errors,
                 );
                 // Todo errors should short-circuit (TS throws throwTodo)
@@ -2024,6 +2096,9 @@ fn apply_effect_ref<'a>(
             let value = mutate_place;
             let mutation_kind = state.mutate_with_span(variant, value.identifier, env, value.span);
             if mutation_kind == MutationResult::Mutate {
+                for value_id in state.values_for(value.identifier) {
+                    context.nonempty_array_values.remove(&value_id);
+                }
                 effects.push(effect.clone_in(context.alloc));
             } else if mutation_kind == MutationResult::MutateRef {
                 // no-op
@@ -2168,6 +2243,7 @@ fn compute_signature_for_instruction<'a>(
                 receiver: *tag,
                 function: *tag,
                 mutates_function: true,
+                is_function_call: true,
                 args,
                 into: *lvalue,
                 signature: Some(env.identifiers[tag.identifier].type_),
@@ -2179,6 +2255,7 @@ fn compute_signature_for_instruction<'a>(
                 receiver: *callee,
                 function: *callee,
                 mutates_function: false,
+                is_function_call: false,
                 args: ArenaVec::from_iter_in(args.iter().map(place_or_spread_to_hole), &alloc),
                 into: *lvalue,
                 signature: Some(env.identifiers[callee.identifier].type_),
@@ -2190,6 +2267,7 @@ fn compute_signature_for_instruction<'a>(
                 receiver: *callee,
                 function: *callee,
                 mutates_function: true,
+                is_function_call: true,
                 args: ArenaVec::from_iter_in(args.iter().map(place_or_spread_to_hole), &alloc),
                 into: *lvalue,
                 signature: Some(env.identifiers[callee.identifier].type_),
@@ -2201,6 +2279,7 @@ fn compute_signature_for_instruction<'a>(
                 receiver: *receiver,
                 function: *property,
                 mutates_function: false,
+                is_function_call: true,
                 args: ArenaVec::from_iter_in(args.iter().map(place_or_spread_to_hole), &alloc),
                 into: *lvalue,
                 signature: Some(env.identifiers[property.identifier].type_),
@@ -2528,10 +2607,12 @@ fn compute_effects_for_legacy_signature<'a>(
     signature: &FunctionSignature,
     lvalue: &Place,
     receiver: &Place,
+    is_function_call: bool,
     args: &[PlaceOrSpreadOrHole],
     span: Option<&Span>,
     env: &Environment<'a>,
     function_values: &FxHashMap<ValueId, FunctionId>,
+    nonempty_array_values: &FxHashSet<ValueId>,
     todo_errors: &mut Vec<OxcDiagnostic>,
 ) -> Vec<AliasingEffect<'a>> {
     let return_value_reason = signature.return_value_reason.unwrap_or(ValueReason::Other);
@@ -2543,7 +2624,20 @@ fn compute_effects_for_legacy_signature<'a>(
         reason: return_value_reason,
     });
 
-    if signature.impure && env.config.validate_no_impure_functions_in_render {
+    if signature.impure
+        && env.config.validate_no_impure_functions_in_render
+        && (!signature.impure_if_no_args
+            || is_function_call
+            || args.iter().all(|arg| match arg {
+                PlaceOrSpreadOrHole::Place(_) => false,
+                PlaceOrSpreadOrHole::Hole => true,
+                PlaceOrSpreadOrHole::Spread(spread) => {
+                    let values = state.values_for(spread.place.identifier);
+                    values.is_empty()
+                        || !values.iter().all(|value| nonempty_array_values.contains(value))
+                }
+            }))
+    {
         let diagnostic =
             diagnostics::impure_function(signature.canonical_name.as_deref(), span.copied());
         let error = env.intern_aliasing_diagnostic(receiver.identifier, diagnostic);
@@ -2925,6 +3019,7 @@ fn compute_effects_for_aliasing_signature_config<'a>(
                         receiver: recv,
                         function: func,
                         mutates_function: *mutates_function,
+                        is_function_call: true,
                         args: apply_args,
                         into,
                         signature: None,
@@ -3153,6 +3248,7 @@ fn compute_effects_for_aliasing_signature<'a>(
                 receiver: r,
                 function: f,
                 mutates_function: mf,
+                is_function_call,
                 args: a,
                 into: i,
                 signature: s,
@@ -3189,6 +3285,7 @@ fn compute_effects_for_aliasing_signature<'a>(
                         receiver: recv,
                         function: func,
                         mutates_function: *mf,
+                        is_function_call: *is_function_call,
                         args: apply_args,
                         into: apply_into,
                         signature: *s,

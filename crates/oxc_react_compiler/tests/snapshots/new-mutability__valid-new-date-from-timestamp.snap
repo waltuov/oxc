@@ -1,0 +1,100 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-from-timestamp.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(27);
+	const { timestamp, other, rest } = t0;
+	let t1;
+	if ($[0] !== timestamp) {
+		t1 = new Date(timestamp);
+		$[0] = timestamp;
+		$[1] = t1;
+	} else {
+		t1 = $[1];
+	}
+	const date = t1;
+	let t2;
+	if ($[2] !== rest || $[3] !== timestamp) {
+		t2 = new Date(timestamp, ...rest);
+		$[2] = rest;
+		$[3] = timestamp;
+		$[4] = t2;
+	} else {
+		t2 = $[4];
+	}
+	const explicitBeforeSpread = t2;
+	let t3;
+	if ($[5] !== rest || $[6] !== timestamp) {
+		t3 = new Date(...rest, timestamp);
+		$[5] = rest;
+		$[6] = timestamp;
+		$[7] = t3;
+	} else {
+		t3 = $[7];
+	}
+	const explicitAfterSpread = t3;
+	let t4;
+	if ($[8] !== timestamp) {
+		t4 = new Date(...[timestamp]);
+		$[8] = timestamp;
+		$[9] = t4;
+	} else {
+		t4 = $[9];
+	}
+	const nonemptyArraySpread = t4;
+	let t5;
+	if ($[10] !== timestamp) {
+		t5 = new Date(...[...[timestamp]]);
+		$[10] = timestamp;
+		$[11] = t5;
+	} else {
+		t5 = $[11];
+	}
+	const nestedNonemptyArraySpread = t5;
+	let boundNonemptyArraySpread;
+	let t6;
+	if ($[12] !== other || $[13] !== timestamp) {
+		const args = [timestamp];
+		boundNonemptyArraySpread = new Date(...args);
+		args.push(other);
+		t6 = new Date(...args);
+		$[12] = other;
+		$[13] = timestamp;
+		$[14] = boundNonemptyArraySpread;
+		$[15] = t6;
+	} else {
+		boundNonemptyArraySpread = $[14];
+		t6 = $[15];
+	}
+	const pushedNonemptyArraySpread = t6;
+	let t7;
+	if ($[16] !== timestamp) {
+		const initiallyEmptyArgs = [];
+		initiallyEmptyArgs.push(timestamp);
+		t7 = new Date(...initiallyEmptyArgs);
+		$[16] = timestamp;
+		$[17] = t7;
+	} else {
+		t7 = $[17];
+	}
+	const pushedFromEmptyArraySpread = t7;
+	let t8;
+	if ($[18] !== boundNonemptyArraySpread || $[19] !== date || $[20] !== explicitAfterSpread || $[21] !== explicitBeforeSpread || $[22] !== nestedNonemptyArraySpread || $[23] !== nonemptyArraySpread || $[24] !== pushedFromEmptyArraySpread || $[25] !== pushedNonemptyArraySpread) {
+		t8 = <Foo date={date} explicitBeforeSpread={explicitBeforeSpread} explicitAfterSpread={explicitAfterSpread} nonemptyArraySpread={nonemptyArraySpread} nestedNonemptyArraySpread={nestedNonemptyArraySpread} boundNonemptyArraySpread={boundNonemptyArraySpread} pushedNonemptyArraySpread={pushedNonemptyArraySpread} pushedFromEmptyArraySpread={pushedFromEmptyArraySpread} />;
+		$[18] = boundNonemptyArraySpread;
+		$[19] = date;
+		$[20] = explicitAfterSpread;
+		$[21] = explicitBeforeSpread;
+		$[22] = nestedNonemptyArraySpread;
+		$[23] = nonemptyArraySpread;
+		$[24] = pushedFromEmptyArraySpread;
+		$[25] = pushedNonemptyArraySpread;
+		$[26] = t8;
+	} else {
+		t8 = $[26];
+	}
+	return t8;
+}
