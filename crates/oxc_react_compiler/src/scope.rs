@@ -4,7 +4,7 @@ use oxc_ast::ast::{
     BindingIdentifier, BindingPattern, IdentifierReference, ImportDeclaration, ModuleExportName,
     PropertyKind,
 };
-use oxc_semantic::{AstNodes, NodeId, Scoping, Semantic};
+use oxc_semantic::{AstNode, AstNodes, NodeId, Scoping, Semantic};
 use oxc_span::{GetSpan, Span};
 use oxc_str::{Ident, Str};
 use oxc_syntax::scope::ScopeFlags;
@@ -390,6 +390,15 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
             .or(runtime_symbol)
     }
 
+    /// Labels do not introduce a binding environment for a function declaration.
+    fn declaration_parent(&self, declaration_id: NodeId) -> &AstNode<'s> {
+        let mut parent = self.nodes.parent_node(declaration_id);
+        while matches!(parent.kind(), AstKind::LabeledStatement(_)) {
+            parent = self.nodes.parent_node(parent.id());
+        }
+        parent
+    }
+
     /// Whether a symbol has a function declaration directly in its owning function body.
     ///
     /// Oxc merges same-scope `var` and function declarations into one symbol, retaining
@@ -401,7 +410,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
             let declaration = self.nodes.get_node(declaration_id);
             matches!(declaration.kind(), AstKind::Function(function) if function.is_declaration())
                 && matches!(
-                    self.nodes.parent_node(declaration.id()).kind(),
+                    self.declaration_parent(declaration.id()).kind(),
                     AstKind::FunctionBody(_)
                 )
         })
@@ -482,7 +491,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                 // Semantic hoisting may have moved a lexically blocked function
                 // into the var scope even though Annex B creates no outer binding.
                 // Outside its declaration block, the implicit object still wins.
-                let parent = self.nodes.parent_node(declaration.id());
+                let parent = self.declaration_parent(declaration.id());
                 if self.scope_kind(self.symbol_scope(symbol_id)) == ScopeKind::Function
                     && let AstKind::BlockStatement(block) = parent.kind()
                 {
@@ -495,7 +504,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                 continue;
             }
 
-            let parent = self.nodes.parent_node(declaration.id());
+            let parent = self.declaration_parent(declaration.id());
             if matches!(parent.kind(), AstKind::SwitchCase(_)) {
                 has_annex_b_declaration = true;
                 if self.nodes.ancestors(parent.id()).any(|ancestor| {
@@ -563,7 +572,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                 return false;
             }
 
-            let parent = self.nodes.parent_node(declaration.id());
+            let parent = self.declaration_parent(declaration.id());
             match parent.kind() {
                 AstKind::BlockStatement(_) => {
                     let block_span = parent.kind().span();
@@ -609,10 +618,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                         return false;
                     }
 
-                    let mut parent = self.nodes.parent_node(declaration.id());
-                    while matches!(parent.kind(), AstKind::LabeledStatement(_)) {
-                        parent = self.nodes.parent_node(parent.id());
-                    }
+                    let parent = self.declaration_parent(declaration.id());
                     match parent.kind() {
                         AstKind::BlockStatement(_) => {
                             let block_span = parent.kind().span();
@@ -670,10 +676,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                         return false;
                     }
 
-                    let mut parent = self.nodes.parent_node(declaration.id());
-                    while matches!(parent.kind(), AstKind::LabeledStatement(_)) {
-                        parent = self.nodes.parent_node(parent.id());
-                    }
+                    let parent = self.declaration_parent(declaration.id());
                     match parent.kind() {
                         AstKind::IfStatement(_) | AstKind::SwitchCase(_) => true,
                         AstKind::BlockStatement(_) => {
@@ -759,7 +762,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                 if !function.is_declaration() {
                     continue;
                 }
-                let parent = self.nodes.parent_node(declaration.id());
+                let parent = self.declaration_parent(declaration.id());
                 let AstKind::BlockStatement(declaration_block) = parent.kind() else { continue };
                 let declaration_position = declaration.kind().span().start;
                 let block_span = parent.kind().span();
