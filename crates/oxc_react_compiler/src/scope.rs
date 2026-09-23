@@ -9,7 +9,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_str::{Ident, Str};
 use oxc_syntax::scope::ScopeFlags;
 use oxc_syntax::symbol::SymbolFlags;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use oxc_syntax::reference::ReferenceId;
 pub use oxc_syntax::scope::ScopeId;
@@ -104,6 +104,14 @@ pub enum ImportBindingKind {
     Namespace,
 }
 
+#[derive(Clone, Copy)]
+struct FunctionDeclarationCandidate {
+    symbol_id: SymbolId,
+    declaration_id: NodeId,
+    /// Earliest reference position that can observe this declaration lexically.
+    visible_start: u32,
+}
+
 /// Read-through view over `Semantic`, replacing the old materialized
 /// `ScopeInfo` copy. Scope and symbol identity comes from the semantic ID
 /// cells on the AST (`scope_id`/`symbol_id`/`reference_id`); everything else
@@ -127,6 +135,11 @@ pub struct ScopeResolver<'s, 'a> {
     /// This supports position lookups in `O(log S + depth)` without rescanning
     /// all scopes for every JSX tag that lacks a semantic reference.
     scopes_by_start: Vec<(u32, u32, usize, ScopeId)>,
+    /// Function declarations indexed by owning function/name and lexical start.
+    function_declarations:
+        FxHashMap<ScopeId, FxHashMap<&'s str, Vec<FunctionDeclarationCandidate>>>,
+    /// Earliest labeled break targeting each label, indexed once for Annex B queries.
+    labeled_breaks: FxHashMap<NodeId, u32>,
 }
 
 impl<'s, 'a> ScopeResolver<'s, 'a> {
@@ -144,6 +157,8 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
             function_scopes: Vec::new(),
             function_scope_ranges: Vec::new(),
             scopes_by_start: Vec::new(),
+            function_declarations: FxHashMap::default(),
+            labeled_breaks: FxHashMap::default(),
         };
 
         let mut scope_depths = Vec::new();
@@ -197,7 +212,63 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                 .then(a.3.index().cmp(&b.3.index()))
         });
 
+        for symbol_id in scoping.symbol_ids() {
+            for declaration_id in scoping.symbol_declarations(symbol_id) {
+                let declaration = nodes.get_node(declaration_id);
+                if !matches!(declaration.kind(), AstKind::Function(function) if function.is_declaration())
+                {
+                    continue;
+                }
+                let Some(function_scope) = resolver
+                    .ancestors(resolver.symbol_scope(symbol_id))
+                    .find(|&scope_id| resolver.scope_kind(scope_id) == ScopeKind::Function)
+                else {
+                    continue;
+                };
+                let parent = resolver.declaration_parent(declaration_id);
+                let visible_start = if matches!(parent.kind(), AstKind::BlockStatement(_)) {
+                    parent.kind().span().start
+                } else {
+                    declaration.kind().span().start
+                };
+                resolver
+                    .function_declarations
+                    .entry(function_scope)
+                    .or_default()
+                    .entry(scoping.symbol_name(symbol_id))
+                    .or_default()
+                    .push(FunctionDeclarationCandidate {
+                        symbol_id,
+                        declaration_id,
+                        visible_start,
+                    });
+            }
+        }
+        for names in resolver.function_declarations.values_mut() {
+            for candidates in names.values_mut() {
+                candidates.sort_unstable_by_key(|candidate| candidate.visible_start);
+            }
+        }
+        for node in nodes.iter() {
+            let AstKind::BreakStatement(statement) = node.kind() else { continue };
+            let Some(label) = &statement.label else { continue };
+            if let Some(target) = nodes.ancestors(node.id()).find(|ancestor| {
+                matches!(ancestor.kind(), AstKind::LabeledStatement(statement) if statement.label.name == label.name)
+            }) {
+                resolver.labeled_breaks.entry(target.id())
+                    .and_modify(|position| *position = (*position).min(statement.span.start))
+                    .or_insert(statement.span.start);
+            }
+        }
+
         resolver
+    }
+
+    fn function_declarations(&self, scope: ScopeId, name: &str) -> &[FunctionDeclarationCandidate] {
+        self.function_declarations
+            .get(&scope)
+            .and_then(|names| names.get(name))
+            .map_or(&[], Vec::as_slice)
     }
 
     fn scoping(&self) -> &'s Scoping {
@@ -425,15 +496,11 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
     fn labeled_statement_has_escaping_break_before(
         &self,
         labeled_statement_id: NodeId,
-        label_name: &str,
         declaration_position: u32,
     ) -> bool {
-        self.nodes.iter().any(|node| {
-            matches!(node.kind(), AstKind::BreakStatement(statement)
-                if statement.label.as_ref().is_some_and(|label| label.name.as_str() == label_name)
-                    && statement.span.start < declaration_position
-                    && self.nodes.ancestor_ids(node.id()).any(|ancestor_id| ancestor_id == labeled_statement_id))
-        })
+        self.labeled_breaks
+            .get(&labeled_statement_id)
+            .is_some_and(|&position| position < declaration_position)
     }
 
     /// The kind of the symbol's declaration AST node.
@@ -542,10 +609,9 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                 let parent = self.nodes.parent_node(block.id());
                 match parent.kind() {
                     AstKind::BlockStatement(_) => block = parent,
-                    AstKind::LabeledStatement(statement)
+                    AstKind::LabeledStatement(_)
                         if !self.labeled_statement_has_escaping_break_before(
                             parent.id(),
-                            statement.label.name.as_str(),
                             declaration_position,
                         ) =>
                     {
@@ -605,34 +671,28 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         name: &str,
         reference_position: u32,
     ) -> bool {
-        self.symbols().any(|symbol_id| {
-            self.symbol_name(symbol_id) == name
-                && self
-                    .ancestors(self.symbol_scope(symbol_id))
-                    .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function)
-                    == Some(function_scope)
-                && self.scoping.symbol_declarations(symbol_id).any(|declaration_id| {
-                    let declaration = self.nodes.get_node(declaration_id);
-                    let AstKind::Function(function) = declaration.kind() else {
-                        return false;
-                    };
-                    if declaration.kind().span().start <= reference_position
-                        || !self.is_annex_b_function_declaration(symbol_id, function)
-                    {
-                        return false;
-                    }
+        self.function_declarations(function_scope, name).iter().any(|candidate| {
+            let symbol_id = candidate.symbol_id;
+            let declaration_id = candidate.declaration_id;
+            let declaration = self.nodes.get_node(declaration_id);
+            let AstKind::Function(function) = declaration.kind() else {
+                return false;
+            };
+            if declaration.kind().span().start <= reference_position
+                || !self.is_annex_b_function_declaration(symbol_id, function)
+            {
+                return false;
+            }
 
-                    let parent = self.declaration_parent(declaration.id());
-                    match parent.kind() {
-                        AstKind::BlockStatement(_) => {
-                            let block_span = parent.kind().span();
-                            !(block_span.start <= reference_position
-                                && reference_position < block_span.end)
-                        }
-                        AstKind::SwitchCase(_) | AstKind::IfStatement(_) => true,
-                        _ => false,
-                    }
-                })
+            let parent = self.declaration_parent(declaration.id());
+            match parent.kind() {
+                AstKind::BlockStatement(_) => {
+                    let block_span = parent.kind().span();
+                    !(block_span.start <= reference_position && reference_position < block_span.end)
+                }
+                AstKind::SwitchCase(_) | AstKind::IfStatement(_) => true,
+                _ => false,
+            }
         })
     }
 
@@ -645,74 +705,66 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         name: &str,
         reference_position: u32,
     ) -> bool {
-        self.symbols().any(|symbol_id| {
-            self.symbol_name(symbol_id) == name
-                && self
-                    .ancestors(self.symbol_scope(symbol_id))
-                    .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function)
-                    == Some(function_scope)
-                && self.scoping.symbol_declarations(symbol_id).any(|declaration_id| {
-                    let declaration = self.nodes.get_node(declaration_id);
-                    let AstKind::Function(function) = declaration.kind() else {
-                        return false;
-                    };
-                    if !self.is_annex_b_function_declaration(symbol_id, function) {
-                        return false;
-                    }
+        self.function_declarations(function_scope, name).iter().any(|candidate| {
+            let symbol_id = candidate.symbol_id;
+            let declaration_id = candidate.declaration_id;
+            let declaration = self.nodes.get_node(declaration_id);
+            let AstKind::Function(function) = declaration.kind() else {
+                return false;
+            };
+            if !self.is_annex_b_function_declaration(symbol_id, function) {
+                return false;
+            }
 
-                    let declaration_position = declaration.kind().span().start;
-                    if declaration_position >= reference_position
-                        && !self.nodes.ancestors(declaration.id()).any(|ancestor| {
-                            matches!(
-                                ancestor.kind(),
-                                AstKind::ForStatement(_)
-                                    | AstKind::ForInStatement(_)
-                                    | AstKind::ForOfStatement(_)
-                                    | AstKind::WhileStatement(_)
-                                    | AstKind::DoWhileStatement(_)
-                            ) && {
-                                let loop_span = ancestor.kind().span();
-                                loop_span.start <= reference_position
-                                    && reference_position < loop_span.end
-                            }
-                        })
+            let declaration_position = declaration.kind().span().start;
+            if declaration_position >= reference_position
+                && !self.nodes.ancestors(declaration.id()).any(|ancestor| {
+                    matches!(
+                        ancestor.kind(),
+                        AstKind::ForStatement(_)
+                            | AstKind::ForInStatement(_)
+                            | AstKind::ForOfStatement(_)
+                            | AstKind::WhileStatement(_)
+                            | AstKind::DoWhileStatement(_)
+                    ) && {
+                        let loop_span = ancestor.kind().span();
+                        loop_span.start <= reference_position && reference_position < loop_span.end
+                    }
+                })
+            {
+                return false;
+            }
+
+            let parent = self.declaration_parent(declaration.id());
+            match parent.kind() {
+                AstKind::IfStatement(_) | AstKind::SwitchCase(_) => true,
+                AstKind::BlockStatement(_) => {
+                    let block_span = parent.kind().span();
+                    if block_span.start <= reference_position && reference_position < block_span.end
                     {
                         return false;
                     }
 
-                    let parent = self.declaration_parent(declaration.id());
-                    match parent.kind() {
-                        AstKind::IfStatement(_) | AstKind::SwitchCase(_) => true,
-                        AstKind::BlockStatement(_) => {
-                            let block_span = parent.kind().span();
-                            if block_span.start <= reference_position
-                                && reference_position < block_span.end
+                    let mut block = parent;
+                    loop {
+                        let parent = self.nodes.parent_node(block.id());
+                        match parent.kind() {
+                            AstKind::BlockStatement(_) => block = parent,
+                            AstKind::LabeledStatement(_)
+                                if !self.labeled_statement_has_escaping_break_before(
+                                    parent.id(),
+                                    declaration_position,
+                                ) =>
                             {
-                                return false;
+                                block = parent;
                             }
-
-                            let mut block = parent;
-                            loop {
-                                let parent = self.nodes.parent_node(block.id());
-                                match parent.kind() {
-                                    AstKind::BlockStatement(_) => block = parent,
-                                    AstKind::LabeledStatement(statement)
-                                        if !self.labeled_statement_has_escaping_break_before(
-                                            parent.id(),
-                                            statement.label.name.as_str(),
-                                            declaration_position,
-                                        ) =>
-                                    {
-                                        block = parent;
-                                    }
-                                    AstKind::FunctionBody(_) => break false,
-                                    _ => break true,
-                                }
-                            }
+                            AstKind::FunctionBody(_) => break false,
+                            _ => break true,
                         }
-                        _ => false,
                     }
-                })
+                }
+                _ => false,
+            }
         })
     }
 
@@ -726,6 +778,12 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         reference_position: u32,
         runtime_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
+        let candidates = self.function_declarations(function_scope, name);
+        let end =
+            candidates.partition_point(|candidate| candidate.visible_start <= reference_position);
+        if end == 0 {
+            return None;
+        }
         let runtime_is_lexical = runtime_symbol.is_some_and(|symbol_id| {
             let nearest_function_scope = self
                 .ancestors(self.symbol_scope(symbol_id))
@@ -751,93 +809,84 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         });
 
         let mut visible = None;
-        for symbol_id in self.symbols() {
-            if self.symbol_name(symbol_id) != name
-                || self
-                    .ancestors(self.symbol_scope(symbol_id))
-                    .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function)
-                    != Some(function_scope)
+        for candidate in &candidates[..end] {
+            let symbol_id = candidate.symbol_id;
+            let declaration_id = candidate.declaration_id;
+            let declaration = self.nodes.get_node(declaration_id);
+            let AstKind::Function(function) = declaration.kind() else {
+                continue;
+            };
+            if !function.is_declaration() {
+                continue;
+            }
+            let parent = self.declaration_parent(declaration.id());
+            let AstKind::BlockStatement(declaration_block) = parent.kind() else { continue };
+            let declaration_position = declaration.kind().span().start;
+            let block_span = parent.kind().span();
+            let inside_block =
+                block_span.start <= reference_position && reference_position < block_span.end;
+            if runtime_is_lexical
+                && (!inside_block
+                    || !declaration_block.scope_id.get().is_some_and(|block_scope| {
+                        self.ancestors(block_scope).any(|scope_id| {
+                            Some(scope_id) == runtime_symbol.map(|id| self.symbol_scope(id))
+                        })
+                    }))
             {
                 continue;
             }
-            for declaration_id in self.scoping.symbol_declarations(symbol_id) {
-                let declaration = self.nodes.get_node(declaration_id);
-                let AstKind::Function(function) = declaration.kind() else {
-                    continue;
-                };
-                if !function.is_declaration() {
+            if !inside_block {
+                if !self.is_annex_b_function_declaration(symbol_id, function) {
                     continue;
                 }
-                let parent = self.declaration_parent(declaration.id());
-                let AstKind::BlockStatement(declaration_block) = parent.kind() else { continue };
-                let declaration_position = declaration.kind().span().start;
-                let block_span = parent.kind().span();
-                let inside_block =
-                    block_span.start <= reference_position && reference_position < block_span.end;
-                if runtime_is_lexical
-                    && (!inside_block
-                        || !declaration_block.scope_id.get().is_some_and(|block_scope| {
-                            self.ancestors(block_scope).any(|scope_id| {
-                                Some(scope_id) == runtime_symbol.map(|id| self.symbol_scope(id))
-                            })
-                        }))
-                {
+                if reference_position < block_span.end {
                     continue;
                 }
-                if !inside_block {
-                    if !self.is_annex_b_function_declaration(symbol_id, function) {
-                        continue;
-                    }
-                    if reference_position < block_span.end {
-                        continue;
-                    }
-                    let mut block = parent;
-                    let unconditionally_entered = loop {
-                        let parent = self.nodes.parent_node(block.id());
-                        match parent.kind() {
-                            AstKind::BlockStatement(_) => block = parent,
-                            AstKind::LabeledStatement(statement)
-                                if !self.labeled_statement_has_escaping_break_before(
-                                    parent.id(),
-                                    statement.label.name.as_str(),
-                                    declaration_position,
-                                ) =>
-                            {
-                                block = parent;
-                            }
-                            // A do-while body and a try or finally body are entered before
-                            // a following reference, but HIR currently keeps their block
-                            // function assignments scoped inside those bodies. Keep the
-                            // safe bailout until lowering can preserve the Annex B outer
-                            // assignment.
-                            AstKind::DoWhileStatement(_) | AstKind::TryStatement(_) => break false,
-                            AstKind::FunctionBody(_) => break true,
-                            _ => break false,
+                let mut block = parent;
+                let unconditionally_entered = loop {
+                    let parent = self.nodes.parent_node(block.id());
+                    match parent.kind() {
+                        AstKind::BlockStatement(_) => block = parent,
+                        AstKind::LabeledStatement(_)
+                            if !self.labeled_statement_has_escaping_break_before(
+                                parent.id(),
+                                declaration_position,
+                            ) =>
+                        {
+                            block = parent;
                         }
-                    };
-                    if !unconditionally_entered {
-                        continue;
+                        // A do-while body and a try or finally body are entered before
+                        // a following reference, but HIR currently keeps their block
+                        // function assignments scoped inside those bodies. Keep the
+                        // safe bailout until lowering can preserve the Annex B outer
+                        // assignment.
+                        AstKind::DoWhileStatement(_) | AstKind::TryStatement(_) => break false,
+                        AstKind::FunctionBody(_) => break true,
+                        _ => break false,
                     }
-                }
-
-                // A reference inside nested declaration blocks observes the
-                // innermost lexical binding, even when an enclosing block has a
-                // later declaration. For references after the blocks, execution
-                // order still follows the declaration position.
-                let lexical_depth = if inside_block {
-                    1 + self
-                        .nodes
-                        .ancestors(parent.id())
-                        .take_while(|ancestor| !matches!(ancestor.kind(), AstKind::FunctionBody(_)))
-                        .filter(|ancestor| matches!(ancestor.kind(), AstKind::BlockStatement(_)))
-                        .count()
-                } else {
-                    0
                 };
-                let rank = (inside_block, lexical_depth, declaration_position);
-                if visible.is_none_or(|(best_rank, _)| rank > best_rank) {
-                    visible = Some((rank, symbol_id));
+                if !unconditionally_entered {
+                    continue;
                 }
+            }
+
+            // A reference inside nested declaration blocks observes the
+            // innermost lexical binding, even when an enclosing block has a
+            // later declaration. For references after the blocks, execution
+            // order still follows the declaration position.
+            let lexical_depth = if inside_block {
+                1 + self
+                    .nodes
+                    .ancestors(parent.id())
+                    .take_while(|ancestor| !matches!(ancestor.kind(), AstKind::FunctionBody(_)))
+                    .filter(|ancestor| matches!(ancestor.kind(), AstKind::BlockStatement(_)))
+                    .count()
+            } else {
+                0
+            };
+            let rank = (inside_block, lexical_depth, declaration_position);
+            if visible.is_none_or(|(best_rank, _)| rank > best_rank) {
+                visible = Some((rank, symbol_id));
             }
         }
         visible.map(|(_, symbol_id)| symbol_id)
