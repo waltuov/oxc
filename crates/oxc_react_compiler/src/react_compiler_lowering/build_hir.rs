@@ -876,20 +876,15 @@ fn record_unsupported_implicit_arguments(
         // non-arrow function, an unresolved `arguments` is a normal global lookup.
         return Ok(false);
     };
-    let runtime_symbol = symbol.and_then(|symbol_id| scope.resolve_runtime_value_symbol(symbol_id));
-    let hidden_by_parameter_environment = runtime_symbol.is_some_and(|symbol_id| {
-        scope.symbol_scope(symbol_id) == arguments_scope
-            && !scope.binding_is_visible_at_position(arguments_scope, symbol_id, span.start)
-    });
-    let runtime_symbol = runtime_symbol.filter(|_| !hidden_by_parameter_environment);
-    let symbol = scope
-        .visible_annex_b_function(arguments_scope, name.as_str(), span.start, runtime_symbol)
-        .or(runtime_symbol);
+    let symbol = scope.resolve_runtime_symbol_at(
+        builder.function_scope(),
+        name.as_str(),
+        span.start,
+        symbol,
+    );
 
     let is_implicit_arguments = match symbol {
-        None => {
-            hidden_by_parameter_environment || matches!(binding, VariableBinding::Global { .. })
-        }
+        None => matches!(binding, VariableBinding::Global { .. }),
         Some(symbol_id) => {
             let symbol_scope = scope.symbol_scope(symbol_id);
             let declared_within_arguments_scope =

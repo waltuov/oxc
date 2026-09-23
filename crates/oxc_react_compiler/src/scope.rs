@@ -358,10 +358,21 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         reference_position: u32,
         symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
-        let runtime_symbol =
+        let mut runtime_symbol =
             symbol.and_then(|symbol_id| self.resolve_runtime_value_symbol(symbol_id));
         if name != "arguments" {
             return runtime_symbol;
+        }
+
+        if let Some(symbol_id) = runtime_symbol {
+            let symbol_scope = self.symbol_scope(symbol_id);
+            if !self.binding_is_visible_at_position(symbol_scope, symbol_id, reference_position) {
+                // Body declarations in arrows are also hidden from parameter
+                // initializers. Continue lookup outside that body's environment.
+                runtime_symbol = self
+                    .find_binding_from_scope_at_position(symbol_scope, name, reference_position)
+                    .and_then(|symbol_id| self.resolve_runtime_value_symbol(symbol_id));
+            }
         }
 
         self.ancestors(function_scope)
@@ -468,6 +479,19 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                 continue;
             };
             if !self.is_annex_b_function_declaration(symbol_id, function) {
+                // Semantic hoisting may have moved a lexically blocked function
+                // into the var scope even though Annex B creates no outer binding.
+                // Outside its declaration block, the implicit object still wins.
+                let parent = self.nodes.parent_node(declaration.id());
+                if self.scope_kind(self.symbol_scope(symbol_id)) == ScopeKind::Function
+                    && let AstKind::BlockStatement(block) = parent.kind()
+                {
+                    if block.span.start <= reference_position && reference_position < block.span.end
+                    {
+                        return Some(false);
+                    }
+                    has_annex_b_declaration = true;
+                }
                 continue;
             }
 
@@ -695,7 +719,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         reference_position: u32,
         runtime_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
-        if runtime_symbol.is_some_and(|symbol_id| {
+        let runtime_is_lexical = runtime_symbol.is_some_and(|symbol_id| {
             let nearest_function_scope = self
                 .ancestors(self.symbol_scope(symbol_id))
                 .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function);
@@ -715,9 +739,7 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                             reference_position,
                         )
                         .is_some())
-        }) {
-            return None;
-        }
+        });
 
         let mut visible = None;
         for symbol_id in self.symbols() {
@@ -734,16 +756,29 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
                 let AstKind::Function(function) = declaration.kind() else {
                     continue;
                 };
-                if !self.is_annex_b_function_declaration(symbol_id, function) {
+                if !function.is_declaration() {
                     continue;
                 }
                 let parent = self.nodes.parent_node(declaration.id());
-                let AstKind::BlockStatement(_) = parent.kind() else { continue };
+                let AstKind::BlockStatement(declaration_block) = parent.kind() else { continue };
                 let declaration_position = declaration.kind().span().start;
                 let block_span = parent.kind().span();
                 let inside_block =
                     block_span.start <= reference_position && reference_position < block_span.end;
+                if runtime_is_lexical
+                    && (!inside_block
+                        || !declaration_block.scope_id.get().is_some_and(|block_scope| {
+                            self.ancestors(block_scope).any(|scope_id| {
+                                Some(scope_id) == runtime_symbol.map(|id| self.symbol_scope(id))
+                            })
+                        }))
+                {
+                    continue;
+                }
                 if !inside_block {
+                    if !self.is_annex_b_function_declaration(symbol_id, function) {
+                        continue;
+                    }
                     if reference_position < block_span.end {
                         continue;
                     }
@@ -804,11 +839,34 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
         symbol_id: SymbolId,
         function: &oxc_ast::ast::Function<'_>,
     ) -> bool {
-        function.is_declaration()
-            && !function.r#async
-            && !function.generator
-            && !self.is_typescript_source
-            && !self.scoping.scope_flags(self.symbol_scope(symbol_id)).is_strict_mode()
+        if !function.is_declaration()
+            || function.r#async
+            || function.generator
+            || self.is_typescript_source
+            || self.scoping.scope_flags(self.symbol_scope(symbol_id)).is_strict_mode()
+        {
+            return false;
+        }
+
+        // Annex B only adds the var-like binding if replacing the block function
+        // with a var would not conflict with an enclosing lexical declaration.
+        // Use the declaration's scope: semantic analysis may already have moved
+        // its symbol into the function scope.
+        let Some(declaration_scope) = function.scope_id.get().and_then(|id| self.scope_parent(id))
+        else {
+            return false;
+        };
+        for scope_id in self.ancestors(declaration_scope).skip(1) {
+            if let Some(binding) = self.get_binding(scope_id, self.symbol_name(symbol_id))
+                && self.scoping.symbol_flags(binding).intersects(SymbolFlags::BlockScoped)
+            {
+                return false;
+            }
+            if self.scope_kind(scope_id) == ScopeKind::Function {
+                break;
+            }
+        }
+        true
     }
 
     /// The symbol's declaration identifier (the first declaration for

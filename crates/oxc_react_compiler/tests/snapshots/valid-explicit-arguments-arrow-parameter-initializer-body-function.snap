@@ -1,0 +1,22 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/valid-explicit-arguments-arrow-parameter-initializer-body-function.js
+---
+const { c: _c } = require("react/compiler-runtime");
+// @script
+function Component(arguments) {
+	const $ = _c(2);
+	let t0;
+	if ($[0] !== arguments) {
+		const read = (t1) => {
+			const copy = t1 === undefined ? arguments : t1;
+			return copy;
+		};
+		t0 = read();
+		$[0] = arguments;
+		$[1] = t0;
+	} else {
+		t0 = $[1];
+	}
+	return t0;
+}

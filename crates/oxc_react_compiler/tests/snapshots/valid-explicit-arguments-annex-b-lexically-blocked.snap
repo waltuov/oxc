@@ -1,0 +1,20 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/valid-explicit-arguments-annex-b-lexically-blocked.js
+---
+const { c: _c } = require("react/compiler-runtime");
+// @script
+function Component() {
+	const $ = _c(1);
+	let t0;
+	if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
+		function arguments() {
+			return 1;
+		}
+		t0 = arguments();
+		$[0] = t0;
+	} else {
+		t0 = $[0];
+	}
+	return t0;
+}
