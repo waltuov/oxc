@@ -41,6 +41,7 @@ use crate::react_compiler_hir::InstructionKind;
 use crate::react_compiler_hir::InstructionValue;
 use crate::react_compiler_hir::JsxAttribute;
 use crate::react_compiler_hir::MutationReason;
+use crate::react_compiler_hir::ObjectPropertyKey;
 use crate::react_compiler_hir::ObjectPropertyOrSpread;
 use crate::react_compiler_hir::ParamPattern;
 use crate::react_compiler_hir::Pattern;
@@ -384,6 +385,15 @@ impl Clone for SpilledValueIdSet {
     }
 }
 
+impl PartialEq for ValueIdSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice().len() == other.as_slice().len()
+            && self.iter().all(|value| other.contains(value))
+    }
+}
+
+impl Eq for ValueIdSet {}
+
 impl Default for ValueIdSet {
     fn default() -> Self {
         Self::Inline { items: [ValueId(0); VALUE_ID_INLINE_CAPACITY], len: 0 }
@@ -450,6 +460,8 @@ impl ValueIdSet {
     }
 }
 
+type KnownProperties = FxHashMap<ValueId, FxHashMap<String, ValueIdSet>>;
+
 /// The abstract state tracked during inference.
 /// The pass has exclusive access to each state (interior mutability only via
 /// the `uninitialized_access` Cell).
@@ -466,6 +478,9 @@ struct InferenceState {
     captured_values: FxHashMap<ValueId, ValueIdSet>,
     /// Allocations that may denote the same runtime object.
     aliased_values: FxHashMap<ValueId, ValueIdSet>,
+    known_properties: KnownProperties,
+    property_keys: FxHashMap<ValueId, String>,
+    exact_property_loads: FxHashSet<ValueId>,
     /// Tracks uninitialized identifier access errors (matches TS invariant).
     /// Uses Cell so it can be set from `&self` methods like `kind()`.
     /// Stores (IdentifierId, usage_span) where usage_span is the source location
@@ -482,6 +497,9 @@ impl InferenceState {
             nonempty_iterable_values: FxHashSet::default(),
             captured_values: FxHashMap::default(),
             aliased_values: FxHashMap::default(),
+            known_properties: KnownProperties::default(),
+            property_keys: FxHashMap::default(),
+            exact_property_loads: FxHashSet::default(),
             uninitialized_access: Cell::new(None),
         }
     }
@@ -566,14 +584,126 @@ impl InferenceState {
         }
     }
 
+    fn is_nonempty_value(&self, value: ValueId, visited: &mut FxHashSet<ValueId>) -> bool {
+        if self.nonempty_iterable_values.contains(&value) {
+            return true;
+        }
+        if !visited.insert(value) {
+            return false;
+        }
+        let result = self.exact_property_loads.contains(&value)
+            && self.aliased_values.get(&value).is_some_and(|aliases| {
+                !aliases.is_empty()
+                    && aliases.iter().all(|alias| self.is_nonempty_value(alias, visited))
+            });
+        visited.remove(&value);
+        result
+    }
+
     fn is_nonempty_iterable(&self, place_id: IdentifierId) -> bool {
         self.variables.get(&place_id).is_some_and(|values| {
+            let mut visited = FxHashSet::default();
             !values.is_empty()
-                && values.iter().all(|value| self.nonempty_iterable_values.contains(&value))
+                && values.iter().all(|value| self.is_nonempty_value(value, &mut visited))
         })
     }
 
+    fn property_key(&self, identifier: IdentifierId) -> Option<String> {
+        let values = self.variables.get(&identifier)?;
+        let mut values = values.iter();
+        let key = self.property_keys.get(&values.next()?)?;
+        values.all(|value| self.property_keys.get(&value) == Some(key)).then(|| key.clone())
+    }
+
+    fn property_roots(&self, identifier: IdentifierId) -> Option<ValueIdSet> {
+        let mut pending = self.values_for(identifier);
+        let mut visited = FxHashSet::default();
+        let mut roots = ValueIdSet::default();
+        while let Some(value) = pending.pop() {
+            if !visited.insert(value) {
+                continue;
+            }
+            if let Some(aliases) = self.aliased_values.get(&value)
+                && !aliases.is_empty()
+                && !self.known_properties.contains_key(&value)
+            {
+                if !self.exact_property_loads.contains(&value) {
+                    return None;
+                }
+                pending.extend(aliases.iter());
+            } else {
+                roots.insert(value);
+            }
+        }
+        Some(roots)
+    }
+
+    fn select_property(&self, identifier: IdentifierId, key: &str) -> Option<ValueIdSet> {
+        let roots = self.property_roots(identifier)?;
+        if roots.is_empty() {
+            return None;
+        }
+        let mut values = ValueIdSet::default();
+        for root in roots.iter() {
+            values.union_with(self.known_properties.get(&root)?.get(key)?);
+        }
+        Some(values)
+    }
+
+    fn refresh_property_captures(&mut self, object: ValueId) {
+        if let Some(properties) = self.known_properties.get(&object) {
+            let mut captures = ValueIdSet::default();
+            for values in properties.values() {
+                captures.union_with(values);
+            }
+            self.captured_values.insert(object, captures);
+        }
+    }
+
+    fn merged_known_properties(&self, other: &Self) -> KnownProperties {
+        let mut merged = KnownProperties::default();
+        for (&object, properties) in &self.known_properties {
+            if let Some(other_properties) = other.known_properties.get(&object) {
+                let mut result = FxHashMap::default();
+                for (key, values) in properties {
+                    if let Some(other_values) = other_properties.get(key) {
+                        let mut values = values.clone();
+                        values.union_with(other_values);
+                        result.insert(key.clone(), values);
+                    }
+                }
+                merged.insert(object, result);
+            } else if !other.values.contains_key(&object) {
+                merged.insert(object, properties.clone());
+            }
+        }
+        for (&object, properties) in &other.known_properties {
+            if !self.values.contains_key(&object) {
+                merged.insert(object, properties.clone());
+            }
+        }
+        merged
+    }
+
+    fn merged_property_keys(&self, other: &Self) -> FxHashMap<ValueId, String> {
+        let mut keys = self.property_keys.clone();
+        keys.retain(|id, key| {
+            !other.values.contains_key(id) || other.property_keys.get(id) == Some(key)
+        });
+        for (&id, key) in &other.property_keys {
+            if !self.values.contains_key(&id) {
+                keys.insert(id, key.clone());
+            }
+        }
+        keys
+    }
+
     fn copy_nonempty_iterable(&mut self, from: IdentifierId, into: ValueId) {
+        if let Some(key) = self.property_key(from) {
+            self.property_keys.insert(into, key);
+        } else {
+            self.property_keys.remove(&into);
+        }
         if self.is_nonempty_iterable(from) {
             self.nonempty_iterable_values.insert(into);
         } else {
@@ -630,7 +760,7 @@ impl InferenceState {
     }
 
     fn invalidate_nonempty_iterables(&mut self, place: IdentifierId, transitive: bool) {
-        if self.nonempty_iterable_values.is_empty() {
+        if self.nonempty_iterable_values.is_empty() && self.known_properties.is_empty() {
             return;
         }
         let mut pending = self.values_for(place);
@@ -640,6 +770,7 @@ impl InferenceState {
                 continue;
             }
             self.nonempty_iterable_values.remove(&value);
+            self.known_properties.remove(&value);
             if let Some(aliases) = self.aliased_values.get(&value) {
                 pending.extend(aliases.iter());
             }
@@ -781,11 +912,23 @@ impl InferenceState {
         }
 
         let nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
+        let known_properties = self.merged_known_properties(other);
+        let property_keys = self.merged_property_keys(other);
+        let mut exact_property_loads = self.exact_property_loads.clone();
+        exact_property_loads.retain(|value| {
+            !other.values.contains_key(value) || other.exact_property_loads.contains(value)
+        });
+        exact_property_loads.extend(
+            other.exact_property_loads.iter().filter(|value| !self.values.contains_key(value)),
+        );
         if next_variables.is_none()
             && next_values.is_none()
             && next_captured_values.is_none()
             && next_aliased_values.is_none()
             && nonempty_iterable_values == self.nonempty_iterable_values
+            && known_properties == self.known_properties
+            && property_keys == self.property_keys
+            && exact_property_loads == self.exact_property_loads
         {
             None
         } else {
@@ -794,6 +937,9 @@ impl InferenceState {
                 values: next_values.unwrap_or_else(|| self.values.clone()),
                 variables: next_variables.unwrap_or_else(|| self.variables.clone()),
                 nonempty_iterable_values,
+                known_properties,
+                property_keys,
+                exact_property_loads,
                 captured_values: next_captured_values
                     .unwrap_or_else(|| self.captured_values.clone()),
                 aliased_values: next_aliased_values.unwrap_or_else(|| self.aliased_values.clone()),
@@ -824,6 +970,14 @@ impl InferenceState {
     /// carry a set flag: a set flag errors out before the state is queued).
     fn merge_from(&mut self, other: &InferenceState) {
         self.nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
+        self.known_properties = self.merged_known_properties(other);
+        self.property_keys = self.merged_property_keys(other);
+        self.exact_property_loads.retain(|value| {
+            !other.values.contains_key(value) || other.exact_property_loads.contains(value)
+        });
+        self.exact_property_loads.extend(
+            other.exact_property_loads.iter().filter(|value| !self.values.contains_key(value)),
+        );
         for (&id, values) in &other.captured_values {
             self.captured_values.entry(id).or_default().union_with(values);
         }
@@ -1420,6 +1574,185 @@ fn infer_context_parameter_bindings(
     }
 }
 
+/// Refine property-derived aliases without changing the mutation inference's
+/// allocation identities. Field values are snapshots; later stores replace them.
+fn update_iterable_properties(
+    state: &mut InferenceState,
+    instruction: &Instruction<'_>,
+    access: Option<(IdentifierId, Option<String>)>,
+    selected: Option<ValueIdSet>,
+    preserved: Vec<(ValueId, FxHashMap<String, ValueIdSet>)>,
+) {
+    if matches!(
+        instruction.value,
+        InstructionValue::PropertyLoad { .. } | InstructionValue::ComputedLoad { .. }
+    ) {
+        for value in state.values_for(instruction.lvalue.identifier) {
+            if let Some(selected) = &selected {
+                state.aliased_values.insert(value, selected.clone());
+                state.exact_property_loads.insert(value);
+            } else {
+                state.exact_property_loads.remove(&value);
+            }
+        }
+    }
+    match &instruction.value {
+        InstructionValue::Primitive { value, .. } => {
+            let key = match value {
+                PrimitiveValue::String(value) => value.to_string(),
+                PrimitiveValue::Number(value) => value.to_string(),
+                PrimitiveValue::Boolean(value) => value.to_string(),
+                PrimitiveValue::Null => "null".to_string(),
+                PrimitiveValue::Undefined => "undefined".to_string(),
+            };
+            for value in state.values_for(instruction.lvalue.identifier) {
+                state.property_keys.insert(value, key.clone());
+            }
+        }
+        InstructionValue::ArrayExpression { elements, .. }
+            if !elements.iter().any(|element| matches!(element, ArrayElement::Spread(_))) =>
+        {
+            let fields: FxHashMap<_, _> = elements
+                .iter()
+                .enumerate()
+                .filter_map(|(index, element)| {
+                    let ArrayElement::Place(place) = element else { return None };
+                    Some((
+                        index.to_string(),
+                        state.variables.get(&place.identifier).cloned().unwrap_or_default(),
+                    ))
+                })
+                .collect();
+            for object in state.values_for(instruction.lvalue.identifier) {
+                state.known_properties.insert(object, fields.clone());
+                state.refresh_property_captures(object);
+            }
+        }
+        InstructionValue::Destructure { lvalue, value, .. } => {
+            let selections: Vec<_> = match &lvalue.pattern {
+                Pattern::Object(pattern) => pattern
+                    .properties
+                    .iter()
+                    .filter_map(|property| {
+                        let ObjectPropertyOrSpread::Property(property) = property else {
+                            return None;
+                        };
+                        let key = match &property.key {
+                            ObjectPropertyKey::Identifier { name, .. }
+                            | ObjectPropertyKey::String { name, .. } => Some(name.to_string()),
+                            ObjectPropertyKey::Computed { name, .. } => {
+                                state.property_key(name.identifier)
+                            }
+                        }?;
+                        Some((property.place.identifier, key))
+                    })
+                    .collect(),
+                Pattern::Array(pattern) => pattern
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| {
+                        let ArrayPatternElement::Place(place) = item else { return None };
+                        Some((place.identifier, index.to_string()))
+                    })
+                    .collect(),
+            };
+            for (into, key) in selections {
+                if let Some(selected) = state.select_property(value.identifier, &key) {
+                    for value in state.values_for(into) {
+                        state.aliased_values.insert(value, selected.clone());
+                        state.exact_property_loads.insert(value);
+                    }
+                } else {
+                    for value in state.values_for(into) {
+                        state.exact_property_loads.remove(&value);
+                    }
+                }
+            }
+        }
+        InstructionValue::ObjectExpression { properties, .. } => {
+            let mut fields = FxHashMap::default();
+            let mut known = true;
+            for property in properties {
+                match property {
+                    ObjectPropertyOrSpread::Property(property) => {
+                        let key = match &property.key {
+                            ObjectPropertyKey::Identifier { name, .. }
+                            | ObjectPropertyKey::String { name, .. } => Some(name.to_string()),
+                            ObjectPropertyKey::Computed { name, .. } => {
+                                state.property_key(name.identifier)
+                            }
+                        };
+                        if let Some(key) = key {
+                            fields.insert(
+                                key,
+                                state
+                                    .variables
+                                    .get(&property.place.identifier)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            );
+                        } else {
+                            known = false;
+                        }
+                    }
+                    ObjectPropertyOrSpread::Spread(spread) => {
+                        let roots =
+                            state.property_roots(spread.place.identifier).unwrap_or_default();
+                        if roots.iter().count() == 1
+                            && let Some(root) = roots.iter().next()
+                            && let Some(properties) = state.known_properties.get(&root)
+                        {
+                            fields.extend(properties.clone());
+                        } else {
+                            known = false;
+                        }
+                    }
+                }
+            }
+            for object in state.values_for(instruction.lvalue.identifier) {
+                if known {
+                    state.known_properties.insert(object, fields.clone());
+                    state.refresh_property_captures(object);
+                } else {
+                    state.known_properties.remove(&object);
+                }
+            }
+        }
+        InstructionValue::PropertyStore { value, .. }
+        | InstructionValue::ComputedStore { value, .. } => {
+            if let Some((object, Some(key))) = access {
+                let roots = state.property_roots(object).unwrap_or_default();
+                let definite = roots.iter().count() == 1;
+                let values = state.variables.get(&value.identifier).cloned().unwrap_or_default();
+                for (object, mut properties) in preserved {
+                    if definite {
+                        properties.insert(key.clone(), values.clone());
+                    } else {
+                        properties.entry(key.clone()).or_default().union_with(&values);
+                    }
+                    state.known_properties.insert(object, properties);
+                    state.refresh_property_captures(object);
+                }
+            }
+        }
+        InstructionValue::PropertyDelete { .. } | InstructionValue::ComputedDelete { .. } => {
+            if let Some((object, Some(key))) = access {
+                let definite =
+                    state.property_roots(object).is_some_and(|roots| roots.iter().count() == 1);
+                for (object, mut properties) in preserved {
+                    if definite {
+                        properties.remove(&key);
+                    }
+                    state.known_properties.insert(object, properties);
+                    state.refresh_property_captures(object);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // =============================================================================
 // inferBlock
 // =============================================================================
@@ -1488,8 +1821,62 @@ fn infer_block<'a>(
             None
         };
 
+        let property_access = context
+            .track_nonempty_iterables
+            .then(|| match &instruction.value {
+                InstructionValue::PropertyLoad { object, property, .. }
+                | InstructionValue::PropertyStore { object, property, .. }
+                | InstructionValue::PropertyDelete { object, property, .. } => {
+                    Some((object.identifier, Some(property.to_string())))
+                }
+                InstructionValue::ComputedLoad { object, property, .. }
+                | InstructionValue::ComputedStore { object, property, .. }
+                | InstructionValue::ComputedDelete { object, property, .. } => {
+                    Some((object.identifier, state.property_key(property.identifier)))
+                }
+                _ => None,
+            })
+            .flatten();
+        let is_load = matches!(
+            instruction.value,
+            InstructionValue::PropertyLoad { .. } | InstructionValue::ComputedLoad { .. }
+        );
+        let selected_values = if is_load {
+            property_access.as_ref().and_then(|(object, key)| {
+                key.as_ref().and_then(|key| state.select_property(*object, key))
+            })
+        } else {
+            None
+        };
+        let preserved_properties: Vec<_> = if !is_load {
+            property_access
+                .as_ref()
+                .into_iter()
+                .flat_map(|(object, _)| {
+                    state.property_roots(*object).unwrap_or_default().iter().collect::<Vec<_>>()
+                })
+                .filter_map(|object| {
+                    state
+                        .known_properties
+                        .get(&object)
+                        .map(|properties| (object, properties.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Apply signature
         let effects = apply_signature(context, state, *instr_idx, instruction, env)?;
+        if context.track_nonempty_iterables {
+            update_iterable_properties(
+                state,
+                instruction,
+                property_access,
+                selected_values,
+                preserved_properties,
+            );
+        }
         if let Some(nonempty) = nonempty_iterable
             && let Some(values) = state.variables.get(&instruction.lvalue.identifier)
         {
@@ -2113,11 +2500,13 @@ fn apply_effect_ref<'a>(
                             state.is_nonempty_iterable(spread.place.identifier)
                         }
                     });
-                    state
-                        .values_for(receiver.identifier)
-                        .into_iter()
+                    let receivers = state.property_roots(receiver.identifier).unwrap_or_default();
+                    let singleton = receivers.iter().count() == 1;
+                    receivers
+                        .iter()
                         .filter(|value_id| {
-                            adds_element || state.nonempty_iterable_values.contains(value_id)
+                            (adds_element && singleton)
+                                || state.nonempty_iterable_values.contains(value_id)
                         })
                         .collect::<Vec<_>>()
                 } else {

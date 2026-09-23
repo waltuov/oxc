@@ -1,0 +1,23 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-detached-property-mutation.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(2);
+	const { timestamp } = t0;
+	let t1;
+	if ($[0] !== timestamp) {
+		const args = [timestamp];
+		const box = { args };
+		box.args = [];
+		box.args.pop();
+		t1 = new Date(...args);
+		$[0] = timestamp;
+		$[1] = t1;
+	} else {
+		t1 = $[1];
+	}
+	return t1;
+}
