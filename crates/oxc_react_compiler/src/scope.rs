@@ -375,19 +375,23 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
             }
         }
 
-        self.ancestors(function_scope)
-            .find(|&scope_id| {
-                self.scope_kind(scope_id) == ScopeKind::Function && !self.is_arrow_scope(scope_id)
-            })
-            .and_then(|arguments_scope| {
-                self.visible_annex_b_function(
-                    arguments_scope,
-                    name,
-                    reference_position,
-                    runtime_symbol,
-                )
-            })
-            .or(runtime_symbol)
+        // Arrows can own explicit Annex B bindings even though they inherit the
+        // implicit arguments object. Normalize those bindings before looking in
+        // the enclosing ordinary function.
+        for scope_id in self.ancestors(function_scope) {
+            if self.scope_kind(scope_id) != ScopeKind::Function {
+                continue;
+            }
+            if let Some(symbol) =
+                self.visible_annex_b_function(scope_id, name, reference_position, runtime_symbol)
+            {
+                return Some(symbol);
+            }
+            if !self.is_arrow_scope(scope_id) {
+                break;
+            }
+        }
+        runtime_symbol
     }
 
     /// Labels do not introduce a binding environment for a function declaration.
@@ -726,7 +730,9 @@ impl<'s, 'a> ScopeResolver<'s, 'a> {
             let nearest_function_scope = self
                 .ancestors(self.symbol_scope(symbol_id))
                 .find(|&scope_id| self.scope_kind(scope_id) == ScopeKind::Function);
-            if nearest_function_scope.is_some_and(|scope_id| self.is_arrow_scope(scope_id)) {
+            if nearest_function_scope
+                .is_some_and(|scope_id| scope_id != function_scope && self.is_arrow_scope(scope_id))
+            {
                 return true;
             }
             let declared_within_function = self
