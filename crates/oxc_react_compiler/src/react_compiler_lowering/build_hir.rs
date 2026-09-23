@@ -869,13 +869,6 @@ fn record_unsupported_implicit_arguments(
     }
 
     let scope = builder.scope();
-    let Some(arguments_scope) = scope.ancestors(builder.function_scope()).find(|&scope_id| {
-        scope.scope_kind(scope_id) == ScopeKind::Function && !scope.is_arrow_scope(scope_id)
-    }) else {
-        // Arrows do not create an implicit arguments object. Without an enclosing
-        // non-arrow function, an unresolved `arguments` is a normal global lookup.
-        return Ok(false);
-    };
     let symbol = scope.resolve_runtime_symbol_at(
         builder.function_scope(),
         name.as_str(),
@@ -883,7 +876,35 @@ fn record_unsupported_implicit_arguments(
         symbol,
     );
 
-    let is_implicit_arguments = match symbol {
+    let unsupported_annex_b = symbol.is_some_and(|symbol_id| {
+        let symbol_scope = scope.symbol_scope(symbol_id);
+        let Some(owner) = scope
+            .ancestors(symbol_scope)
+            .find(|&scope_id| scope.scope_kind(scope_id) == ScopeKind::Function)
+        else {
+            return false;
+        };
+        // Recovered symbols retain their declaration block's scope, but outside
+        // reads observe a shared outer binding. Explicit arrow bindings behave
+        // the same way, including arrows without an enclosing ordinary function.
+        let overwritable =
+            scope.annex_b_function_observes_implicit_arguments_at(symbol_id, span.start).is_some()
+                || (symbol_scope == owner
+                    && (scope.binding_kind(symbol_id) == AstBindingKind::Var
+                        || scope.has_body_level_function_declaration(symbol_id)));
+        overwritable
+            && !scope.annex_b_function_uses_lexical_binding_at(symbol_id, span.start)
+            && (scope.has_conditional_annex_b_function_declaration_before(
+                owner,
+                name.as_str(),
+                span.start,
+            ) || (builder.function_scope() != owner
+                && scope.has_annex_b_function_declaration_after(owner, name.as_str(), span.start)))
+    });
+    let arguments_scope = scope.ancestors(builder.function_scope()).find(|&scope_id| {
+        scope.scope_kind(scope_id) == ScopeKind::Function && !scope.is_arrow_scope(scope_id)
+    });
+    let is_implicit_arguments = arguments_scope.is_some_and(|arguments_scope| match symbol {
         None => matches!(binding, VariableBinding::Global { .. }),
         Some(symbol_id) => {
             let symbol_scope = scope.symbol_scope(symbol_id);
@@ -891,35 +912,11 @@ fn record_unsupported_implicit_arguments(
                 scope.ancestors(symbol_scope).any(|scope_id| scope_id == arguments_scope);
             let annex_b_binding =
                 scope.annex_b_function_observes_implicit_arguments_at(symbol_id, span.start);
-            let binding_kind = scope.binding_kind(symbol_id);
-            let has_body_level_function = scope.has_body_level_function_declaration(symbol_id);
-            let is_implicit_var_binding = binding_kind == AstBindingKind::Var
-                && !has_body_level_function
+            let is_implicit_var_binding = scope.binding_kind(symbol_id) == AstBindingKind::Var
+                && !scope.has_body_level_function_declaration(symbol_id)
                 && annex_b_binding != Some(false);
-            let annex_b_overwritable_function_binding = symbol_scope == arguments_scope
-                && (binding_kind == AstBindingKind::Var || has_body_level_function);
-            let conditional_annex_b_may_overwrite_binding = annex_b_overwritable_function_binding
-                && !scope.annex_b_function_uses_lexical_binding_at(symbol_id, span.start)
-                && scope.has_conditional_annex_b_function_declaration_before(
-                    arguments_scope,
-                    name.as_str(),
-                    span.start,
-                );
-            let captured_annex_b_binding_may_be_overwritten = builder.function_scope()
-                != arguments_scope
-                && ((annex_b_binding.is_some()
-                    && !scope.annex_b_function_uses_lexical_binding_at(symbol_id, span.start))
-                    || annex_b_overwritable_function_binding)
-                && scope.has_annex_b_function_declaration_after(
-                    arguments_scope,
-                    name.as_str(),
-                    span.start,
-                );
 
-            // Oxc may resolve through the nearest non-arrow function to an outer symbol.
-            // An `arguments` symbol for that function's `var`, TypeScript enum,
-            // function-expression self-name, or an Annex B function outside its
-            // declaration block also loses to the implicit object.
+            // An outer symbol loses to this function's implicit arguments object.
             !declared_within_arguments_scope
                 || (symbol_scope == arguments_scope
                     && (is_implicit_var_binding
@@ -928,12 +925,10 @@ fn record_unsupported_implicit_arguments(
                             DeclKind::FunctionExpression | DeclKind::TSEnumDeclaration
                         )
                         || annex_b_binding == Some(true)))
-                || conditional_annex_b_may_overwrite_binding
-                || captured_annex_b_binding_may_be_overwritten
         }
-    };
+    });
 
-    if is_implicit_arguments {
+    if is_implicit_arguments || unsupported_annex_b {
         builder.record_error(diagnostics::unsupported_implicit_arguments(span))?;
         return Ok(true);
     }
