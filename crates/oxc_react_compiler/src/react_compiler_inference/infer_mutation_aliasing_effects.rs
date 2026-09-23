@@ -462,8 +462,10 @@ struct InferenceState {
     variables: FxHashMap<IdentifierId, ValueIdSet>,
     /// Values guaranteed nonempty on every incoming path where they exist.
     nonempty_iterable_values: FxHashSet<ValueId>,
-    /// Values reachable through a container or a property-derived alias.
+    /// Values stored inside another allocation.
     captured_values: FxHashMap<ValueId, ValueIdSet>,
+    /// Allocations that may denote the same runtime object.
+    aliased_values: FxHashMap<ValueId, ValueIdSet>,
     /// Tracks uninitialized identifier access errors (matches TS invariant).
     /// Uses Cell so it can be set from `&self` methods like `kind()`.
     /// Stores (IdentifierId, usage_span) where usage_span is the source location
@@ -479,6 +481,7 @@ impl InferenceState {
             variables: FxHashMap::default(),
             nonempty_iterable_values: FxHashSet::default(),
             captured_values: FxHashMap::default(),
+            aliased_values: FxHashMap::default(),
             uninitialized_access: Cell::new(None),
         }
     }
@@ -593,7 +596,40 @@ impl InferenceState {
         }
     }
 
-    fn invalidate_nonempty_iterables(&mut self, place: IdentifierId) {
+    fn alias_values(&mut self, from: IdentifierId, into: IdentifierId) {
+        let (Some(from_values), Some(into_values)) =
+            (self.variables.get(&from), self.variables.get(&into))
+        else {
+            return;
+        };
+        for into in into_values.iter() {
+            self.aliased_values.entry(into).or_default().union_with(from_values);
+        }
+    }
+
+    fn alias_captured_values(&mut self, from: IdentifierId, into: IdentifierId) {
+        // A property load can alias a stored value, but not its owning container.
+        // Follow aliases of the container before collecting its direct contents.
+        let mut pending = self.values_for(from);
+        let mut visited = FxHashSet::default();
+        let mut captured = ValueIdSet::default();
+        while let Some(value) = pending.pop() {
+            if !visited.insert(value) {
+                continue;
+            }
+            if let Some(aliases) = self.aliased_values.get(&value) {
+                pending.extend(aliases.iter());
+            }
+            if let Some(values) = self.captured_values.get(&value) {
+                captured.union_with(values);
+            }
+        }
+        for into in self.values_for(into) {
+            self.aliased_values.entry(into).or_default().union_with(&captured);
+        }
+    }
+
+    fn invalidate_nonempty_iterables(&mut self, place: IdentifierId, transitive: bool) {
         if self.nonempty_iterable_values.is_empty() {
             return;
         }
@@ -604,7 +640,10 @@ impl InferenceState {
                 continue;
             }
             self.nonempty_iterable_values.remove(&value);
-            if let Some(captures) = self.captured_values.get(&value) {
+            if let Some(aliases) = self.aliased_values.get(&value) {
+                pending.extend(aliases.iter());
+            }
+            if transitive && let Some(captures) = self.captured_values.get(&value) {
                 pending.extend(captures.iter());
             }
         }
@@ -673,6 +712,7 @@ impl InferenceState {
         let mut next_values: Option<FxHashMap<ValueId, AbstractValue>> = None;
         let mut next_variables: Option<FxHashMap<IdentifierId, ValueIdSet>> = None;
         let mut next_captured_values: Option<FxHashMap<ValueId, ValueIdSet>> = None;
+        let mut next_aliased_values: Option<FxHashMap<ValueId, ValueIdSet>> = None;
 
         // Merge values present in both
         for (id, this_value) in &self.values {
@@ -726,11 +766,25 @@ impl InferenceState {
                     .union_with(other_values);
             }
         }
+        for (&id, other_values) in &other.aliased_values {
+            if self
+                .aliased_values
+                .get(&id)
+                .is_none_or(|values| contributes_new_value(values, other_values))
+            {
+                next_aliased_values
+                    .get_or_insert_with(|| self.aliased_values.clone())
+                    .entry(id)
+                    .or_default()
+                    .union_with(other_values);
+            }
+        }
 
         let nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         if next_variables.is_none()
             && next_values.is_none()
             && next_captured_values.is_none()
+            && next_aliased_values.is_none()
             && nonempty_iterable_values == self.nonempty_iterable_values
         {
             None
@@ -742,6 +796,7 @@ impl InferenceState {
                 nonempty_iterable_values,
                 captured_values: next_captured_values
                     .unwrap_or_else(|| self.captured_values.clone()),
+                aliased_values: next_aliased_values.unwrap_or_else(|| self.aliased_values.clone()),
                 uninitialized_access: Cell::new(None),
             })
         }
@@ -771,6 +826,9 @@ impl InferenceState {
         self.nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         for (&id, values) in &other.captured_values {
             self.captured_values.entry(id).or_default().union_with(values);
+        }
+        for (&id, values) in &other.aliased_values {
+            self.aliased_values.entry(id).or_default().union_with(values);
         }
         for (id, other_value) in &other.values {
             match self.values.get(id) {
@@ -1741,9 +1799,7 @@ fn apply_effect_ref<'a>(
             if context.track_nonempty_iterables
                 && !matches!(from_value.kind, ValueKind::Primitive | ValueKind::Global)
             {
-                // A property-derived value may refer to any captured descendant.
-                state.capture_values(from.identifier, into.identifier);
-                state.capture_values(into.identifier, from.identifier);
+                state.alias_captured_values(from.identifier, into.identifier);
             }
             match from_value.kind {
                 ValueKind::Primitive | ValueKind::Global => {
@@ -1893,9 +1949,11 @@ fn apply_effect_ref<'a>(
                 && source_type.is_some()
                 && destination_type.is_some()
             {
-                state.capture_values(from.identifier, into.identifier);
-                if !is_capture {
-                    state.capture_values(into.identifier, from.identifier);
+                if is_capture {
+                    state.capture_values(from.identifier, into.identifier);
+                } else {
+                    state.alias_values(from.identifier, into.identifier);
+                    state.alias_values(into.identifier, from.identifier);
                 }
             }
 
@@ -2208,7 +2266,14 @@ fn apply_effect_ref<'a>(
             let value = mutate_place;
             let mutation_kind = state.mutate_with_span(variant, value.identifier, env, value.span);
             if mutation_kind == MutationResult::Mutate {
-                state.invalidate_nonempty_iterables(value.identifier);
+                state.invalidate_nonempty_iterables(
+                    value.identifier,
+                    matches!(
+                        variant,
+                        MutateVariant::MutateTransitive
+                            | MutateVariant::MutateTransitiveConditionally
+                    ),
+                );
                 effects.push(effect.clone_in(context.alloc));
             } else if mutation_kind == MutationResult::MutateRef {
                 // no-op

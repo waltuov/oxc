@@ -1,0 +1,27 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-unrelated-container-writes.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(3);
+	const { timestamp, key } = t0;
+	let t1;
+	if ($[0] !== key || $[1] !== timestamp) {
+		const args = [timestamp];
+		const box = { args };
+		box.other = 1;
+		box[key] = 2;
+		delete box.other;
+		const outer = { box };
+		outer.box.other = 3;
+		t1 = new Date(...args);
+		$[0] = key;
+		$[1] = timestamp;
+		$[2] = t1;
+	} else {
+		t1 = $[2];
+	}
+	return t1;
+}
