@@ -186,6 +186,10 @@ pub fn infer_mutation_aliasing_effects<'a>(
         is_function_expression,
         hoisted_context_declarations,
         non_mutating_spreads,
+        track_nonempty_iterables: env.config.validate_no_impure_functions_in_render
+            && func.instructions.iter().any(|instruction| {
+                matches!(instruction.value, InstructionValue::NewExpression { .. })
+            }),
         effect_value_id_cache: FxHashMap::default(),
         function_values: FxHashMap::default(),
         function_signature_cache: FxHashMap::default(),
@@ -458,6 +462,8 @@ struct InferenceState {
     variables: FxHashMap<IdentifierId, ValueIdSet>,
     /// Values guaranteed nonempty on every incoming path where they exist.
     nonempty_iterable_values: FxHashSet<ValueId>,
+    /// Values reachable through a container or a property-derived alias.
+    captured_values: FxHashMap<ValueId, ValueIdSet>,
     /// Tracks uninitialized identifier access errors (matches TS invariant).
     /// Uses Cell so it can be set from `&self` methods like `kind()`.
     /// Stores (IdentifierId, usage_span) where usage_span is the source location
@@ -472,6 +478,7 @@ impl InferenceState {
             values: FxHashMap::default(),
             variables: FxHashMap::default(),
             nonempty_iterable_values: FxHashSet::default(),
+            captured_values: FxHashMap::default(),
             uninitialized_access: Cell::new(None),
         }
     }
@@ -575,6 +582,34 @@ impl InferenceState {
         self.kind_with_span(place_id, None)
     }
 
+    fn capture_values(&mut self, from: IdentifierId, into: IdentifierId) {
+        let (Some(from_values), Some(into_values)) =
+            (self.variables.get(&from), self.variables.get(&into))
+        else {
+            return;
+        };
+        for into in into_values.iter() {
+            self.captured_values.entry(into).or_default().union_with(from_values);
+        }
+    }
+
+    fn invalidate_nonempty_iterables(&mut self, place: IdentifierId) {
+        if self.nonempty_iterable_values.is_empty() {
+            return;
+        }
+        let mut pending = self.values_for(place);
+        let mut visited = FxHashSet::default();
+        while let Some(value) = pending.pop() {
+            if !visited.insert(value) {
+                continue;
+            }
+            self.nonempty_iterable_values.remove(&value);
+            if let Some(captures) = self.captured_values.get(&value) {
+                pending.extend(captures.iter());
+            }
+        }
+    }
+
     fn freeze(&mut self, place_id: IdentifierId, reason: ValueReason) -> bool {
         // Check if defined first to avoid recording uninitialized access error.
         // Freeze on undefined identifiers is a no-op — this matches the TS
@@ -637,6 +672,7 @@ impl InferenceState {
     fn merge(&self, other: &InferenceState) -> Option<InferenceState> {
         let mut next_values: Option<FxHashMap<ValueId, AbstractValue>> = None;
         let mut next_variables: Option<FxHashMap<IdentifierId, ValueIdSet>> = None;
+        let mut next_captured_values: Option<FxHashMap<ValueId, ValueIdSet>> = None;
 
         // Merge values present in both
         for (id, this_value) in &self.values {
@@ -677,9 +713,24 @@ impl InferenceState {
             }
         }
 
+        for (&id, other_values) in &other.captured_values {
+            if self
+                .captured_values
+                .get(&id)
+                .is_none_or(|values| contributes_new_value(values, other_values))
+            {
+                next_captured_values
+                    .get_or_insert_with(|| self.captured_values.clone())
+                    .entry(id)
+                    .or_default()
+                    .union_with(other_values);
+            }
+        }
+
         let nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         if next_variables.is_none()
             && next_values.is_none()
+            && next_captured_values.is_none()
             && nonempty_iterable_values == self.nonempty_iterable_values
         {
             None
@@ -689,6 +740,8 @@ impl InferenceState {
                 values: next_values.unwrap_or_else(|| self.values.clone()),
                 variables: next_variables.unwrap_or_else(|| self.variables.clone()),
                 nonempty_iterable_values,
+                captured_values: next_captured_values
+                    .unwrap_or_else(|| self.captured_values.clone()),
                 uninitialized_access: Cell::new(None),
             })
         }
@@ -716,6 +769,9 @@ impl InferenceState {
     /// carry a set flag: a set flag errors out before the state is queued).
     fn merge_from(&mut self, other: &InferenceState) {
         self.nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
+        for (&id, values) in &other.captured_values {
+            self.captured_values.entry(id).or_default().union_with(values);
+        }
         for (id, other_value) in &other.values {
             match self.values.get(id) {
                 Some(this_value) => {
@@ -810,6 +866,8 @@ struct Context<'a> {
     is_function_expression: bool,
     hoisted_context_declarations: FxHashMap<DeclarationId, Option<Place>>,
     non_mutating_spreads: FxHashSet<IdentifierId>,
+    /// Cardinality and capture facts are only needed for constructor purity checks.
+    track_nonempty_iterables: bool,
     /// Cache of ValueIds keyed by effect key, ensuring stable allocation-site identity
     /// across fixpoint iterations. Mirrors TS `effectInstructionValueCache`.
     effect_value_id_cache: FxHashMap<EffectKey, ValueId>,
@@ -1350,19 +1408,26 @@ fn infer_block<'a>(
         // stores, phi joins, and mutations have been applied. A literal-only scan
         // cannot recognize [...local] or invalidate a mutated spread operand.
         let instruction = &func.instructions[instr_index];
-        let nonempty_iterable = match &instruction.value {
-            InstructionValue::ArrayExpression { elements, .. } => {
-                Some(elements.iter().any(|element| match element {
-                    ArrayElement::Spread(spread) => {
-                        state.is_nonempty_iterable(spread.place.identifier)
-                    }
-                    _ => true,
-                }))
+        let nonempty_iterable = if context.track_nonempty_iterables {
+            match &instruction.value {
+                InstructionValue::ArrayExpression { elements, .. } => {
+                    Some(elements.iter().any(|element| match element {
+                        ArrayElement::Spread(spread) => {
+                            state.is_nonempty_iterable(spread.place.identifier)
+                        }
+                        _ => true,
+                    }))
+                }
+                InstructionValue::Primitive { value: PrimitiveValue::String(value), .. } => {
+                    Some(!value.is_empty())
+                }
+                InstructionValue::TemplateLiteral { quasis, .. } => Some(
+                    quasis.iter().any(|quasi| quasi.cooked.is_some_and(|value| !value.is_empty())),
+                ),
+                _ => None,
             }
-            InstructionValue::Primitive { value: PrimitiveValue::String(value), .. } => {
-                Some(!value.is_empty())
-            }
-            _ => None,
+        } else {
+            None
         };
 
         // Apply signature
@@ -1673,6 +1738,13 @@ fn apply_effect_ref<'a>(
                 AbstractValue { kind: from_value.kind, reason: from_value.reason },
             );
             state.define(into.identifier, value_id);
+            if context.track_nonempty_iterables
+                && !matches!(from_value.kind, ValueKind::Primitive | ValueKind::Global)
+            {
+                // A property-derived value may refer to any captured descendant.
+                state.capture_values(from.identifier, into.identifier);
+                state.capture_values(into.identifier, from.identifier);
+            }
             match from_value.kind {
                 ValueKind::Primitive | ValueKind::Global => {
                     let first_reason = primary_reason(&from_value.reason);
@@ -1816,6 +1888,16 @@ fn apply_effect_ref<'a>(
                 ValueKind::MaybeFrozen | ValueKind::Frozen => Some("frozen"),
                 ValueKind::Mutable => Some("mutable"),
             };
+
+            if context.track_nonempty_iterables
+                && source_type.is_some()
+                && destination_type.is_some()
+            {
+                state.capture_values(from.identifier, into.identifier);
+                if !is_capture {
+                    state.capture_values(into.identifier, from.identifier);
+                }
+            }
 
             if source_type == Some("frozen") {
                 apply_effect(
@@ -1963,25 +2045,26 @@ fn apply_effect_ref<'a>(
                 env.get_function_signature(ty).ok().flatten().cloned()
             });
             if let Some(sig) = &sig_owned {
-                let preserved_nonempty_receiver_values =
-                    if sig.canonical_name.as_deref() == Some("Array.push") {
-                        let adds_element = args.iter().any(|arg| match arg {
-                            PlaceOrSpreadOrHole::Place(_) => true,
-                            PlaceOrSpreadOrHole::Hole => false,
-                            PlaceOrSpreadOrHole::Spread(spread) => {
-                                state.is_nonempty_iterable(spread.place.identifier)
-                            }
-                        });
-                        state
-                            .values_for(receiver.identifier)
-                            .into_iter()
-                            .filter(|value_id| {
-                                adds_element || state.nonempty_iterable_values.contains(value_id)
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
+                let preserved_nonempty_receiver_values = if context.track_nonempty_iterables
+                    && sig.canonical_name.as_deref() == Some("Array.push")
+                {
+                    let adds_element = args.iter().any(|arg| match arg {
+                        PlaceOrSpreadOrHole::Place(_) => true,
+                        PlaceOrSpreadOrHole::Hole => false,
+                        PlaceOrSpreadOrHole::Spread(spread) => {
+                            state.is_nonempty_iterable(spread.place.identifier)
+                        }
+                    });
+                    state
+                        .values_for(receiver.identifier)
+                        .into_iter()
+                        .filter(|value_id| {
+                            adds_element || state.nonempty_iterable_values.contains(value_id)
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 // Check known_incompatible (TS line 2351-2370)
                 if let Some(ref incompatible_msg) = sig.known_incompatible
                     && env.enable_validations()
@@ -2125,9 +2208,7 @@ fn apply_effect_ref<'a>(
             let value = mutate_place;
             let mutation_kind = state.mutate_with_span(variant, value.identifier, env, value.span);
             if mutation_kind == MutationResult::Mutate {
-                for value_id in state.values_for(value.identifier) {
-                    state.nonempty_iterable_values.remove(&value_id);
-                }
+                state.invalidate_nonempty_iterables(value.identifier);
                 effects.push(effect.clone_in(context.alloc));
             } else if mutation_kind == MutationResult::MutateRef {
                 // no-op

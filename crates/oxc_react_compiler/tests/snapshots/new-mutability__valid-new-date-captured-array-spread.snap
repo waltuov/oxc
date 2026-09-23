@@ -1,0 +1,46 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-captured-array-spread.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(9);
+	const { timestamp } = t0;
+	let t1;
+	if ($[0] !== timestamp) {
+		t1 = [timestamp];
+		$[0] = timestamp;
+		$[1] = t1;
+	} else {
+		t1 = $[1];
+	}
+	const args = t1;
+	let t2;
+	if ($[2] !== args) {
+		t2 = { args };
+		$[2] = args;
+		$[3] = t2;
+	} else {
+		t2 = $[3];
+	}
+	const box = t2;
+	let t3;
+	if ($[4] !== args) {
+		t3 = new Date(...args);
+		$[4] = args;
+		$[5] = t3;
+	} else {
+		t3 = $[5];
+	}
+	let t4;
+	if ($[6] !== box || $[7] !== t3) {
+		t4 = [box, t3];
+		$[6] = box;
+		$[7] = t3;
+		$[8] = t4;
+	} else {
+		t4 = $[8];
+	}
+	return t4;
+}
