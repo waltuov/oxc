@@ -189,7 +189,8 @@ pub fn infer_mutation_aliasing_effects<'a>(
         non_mutating_spreads,
         track_nonempty_iterables: env.config.validate_no_impure_functions_in_render
             && func.instructions.iter().any(|instruction| {
-                matches!(instruction.value, InstructionValue::NewExpression { .. })
+                matches!(&instruction.value, InstructionValue::NewExpression { args, .. }
+                    if !args.is_empty() && args.iter().all(|arg| matches!(arg, PlaceOrSpread::Spread(_))))
             }),
         effect_value_id_cache: FxHashMap::default(),
         function_values: FxHashMap::default(),
@@ -481,6 +482,8 @@ struct InferenceState {
     known_properties: KnownProperties,
     property_keys: FxHashMap<ValueId, String>,
     exact_property_loads: FxHashSet<ValueId>,
+    builtin_array_push: FxHashSet<ValueId>,
+    default_array_prototypes: FxHashSet<ValueId>,
     /// Tracks uninitialized identifier access errors (matches TS invariant).
     /// Uses Cell so it can be set from `&self` methods like `kind()`.
     /// Stores (IdentifierId, usage_span) where usage_span is the source location
@@ -500,6 +503,8 @@ impl InferenceState {
             known_properties: KnownProperties::default(),
             property_keys: FxHashMap::default(),
             exact_property_loads: FxHashSet::default(),
+            builtin_array_push: FxHashSet::default(),
+            default_array_prototypes: FxHashSet::default(),
             uninitialized_access: Cell::new(None),
         }
     }
@@ -760,7 +765,10 @@ impl InferenceState {
     }
 
     fn invalidate_nonempty_iterables(&mut self, place: IdentifierId, transitive: bool) {
-        if self.nonempty_iterable_values.is_empty() && self.known_properties.is_empty() {
+        if self.nonempty_iterable_values.is_empty()
+            && self.known_properties.is_empty()
+            && self.default_array_prototypes.is_empty()
+        {
             return;
         }
         let mut pending = self.values_for(place);
@@ -771,6 +779,8 @@ impl InferenceState {
             }
             self.nonempty_iterable_values.remove(&value);
             self.known_properties.remove(&value);
+            self.builtin_array_push.remove(&value);
+            self.default_array_prototypes.remove(&value);
             if let Some(aliases) = self.aliased_values.get(&value) {
                 pending.extend(aliases.iter());
             }
@@ -914,6 +924,16 @@ impl InferenceState {
         let nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         let known_properties = self.merged_known_properties(other);
         let property_keys = self.merged_property_keys(other);
+        let builtin_array_push = self.merged_allocation_facts(
+            other,
+            &self.builtin_array_push,
+            &other.builtin_array_push,
+        );
+        let default_array_prototypes = self.merged_allocation_facts(
+            other,
+            &self.default_array_prototypes,
+            &other.default_array_prototypes,
+        );
         let mut exact_property_loads = self.exact_property_loads.clone();
         exact_property_loads.retain(|value| {
             !other.values.contains_key(value) || other.exact_property_loads.contains(value)
@@ -929,6 +949,8 @@ impl InferenceState {
             && known_properties == self.known_properties
             && property_keys == self.property_keys
             && exact_property_loads == self.exact_property_loads
+            && builtin_array_push == self.builtin_array_push
+            && default_array_prototypes == self.default_array_prototypes
         {
             None
         } else {
@@ -940,12 +962,26 @@ impl InferenceState {
                 known_properties,
                 property_keys,
                 exact_property_loads,
+                builtin_array_push,
+                default_array_prototypes,
                 captured_values: next_captured_values
                     .unwrap_or_else(|| self.captured_values.clone()),
                 aliased_values: next_aliased_values.unwrap_or_else(|| self.aliased_values.clone()),
                 uninitialized_access: Cell::new(None),
             })
         }
+    }
+
+    fn merged_allocation_facts(
+        &self,
+        other: &Self,
+        facts: &FxHashSet<ValueId>,
+        other_facts: &FxHashSet<ValueId>,
+    ) -> FxHashSet<ValueId> {
+        let mut merged = facts.clone();
+        merged.retain(|value| !other.values.contains_key(value) || other_facts.contains(value));
+        merged.extend(other_facts.iter().filter(|value| !self.values.contains_key(value)));
+        merged
     }
 
     fn merged_nonempty_iterable_values(&self, other: &Self) -> FxHashSet<ValueId> {
@@ -972,6 +1008,16 @@ impl InferenceState {
         self.nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         self.known_properties = self.merged_known_properties(other);
         self.property_keys = self.merged_property_keys(other);
+        self.builtin_array_push = self.merged_allocation_facts(
+            other,
+            &self.builtin_array_push,
+            &other.builtin_array_push,
+        );
+        self.default_array_prototypes = self.merged_allocation_facts(
+            other,
+            &self.default_array_prototypes,
+            &other.default_array_prototypes,
+        );
         self.exact_property_loads.retain(|value| {
             !other.values.contains_key(value) || other.exact_property_loads.contains(value)
         });
@@ -1583,6 +1629,12 @@ fn update_iterable_properties(
     selected: Option<ValueIdSet>,
     preserved: Vec<(ValueId, FxHashMap<String, ValueIdSet>)>,
 ) {
+    if matches!(instruction.value, InstructionValue::ArrayExpression { .. }) {
+        for value in state.values_for(instruction.lvalue.identifier) {
+            state.builtin_array_push.insert(value);
+            state.default_array_prototypes.insert(value);
+        }
+    }
     if matches!(
         instruction.value,
         InstructionValue::PropertyLoad { .. } | InstructionValue::ComputedLoad { .. }
@@ -1866,8 +1918,40 @@ fn infer_block<'a>(
             Vec::new()
         };
 
+        let mut preserved_push = Vec::new();
+        let mut preserved_prototypes = Vec::new();
+        let mut preserved_nonempty_arrays = Vec::new();
+        if !is_load
+            && let Some((object, Some(key))) = &property_access
+            && key != "__proto__"
+        {
+            for value in state.property_roots(*object).unwrap_or_default().iter() {
+                if state.default_array_prototypes.contains(&value) {
+                    preserved_prototypes.push(value);
+                    // Ordinary own-property writes cannot shorten an array.
+                    // Unknown keys and prototype changes remain conservative.
+                    if key != "length" && state.nonempty_iterable_values.contains(&value) {
+                        preserved_nonempty_arrays.push(value);
+                    }
+                    if matches!(
+                        instruction.value,
+                        InstructionValue::PropertyDelete { .. }
+                            | InstructionValue::ComputedDelete { .. }
+                    ) && key == "push"
+                    {
+                        preserved_push.push(value);
+                    }
+                }
+                if key != "push" && state.builtin_array_push.contains(&value) {
+                    preserved_push.push(value);
+                }
+            }
+        }
         // Apply signature
         let effects = apply_signature(context, state, *instr_idx, instruction, env)?;
+        state.builtin_array_push.extend(preserved_push);
+        state.default_array_prototypes.extend(preserved_prototypes);
+        state.nonempty_iterable_values.extend(preserved_nonempty_arrays);
         if context.track_nonempty_iterables {
             update_iterable_properties(
                 state,
@@ -2433,7 +2517,14 @@ fn apply_effect_ref<'a>(
             // First, check if the callee is a locally-declared function expression
             // whose aliasing effects we already know (TS lines 1016-1068)
             if state.is_defined(function.identifier) {
-                let function_values = state.values_for(function.identifier);
+                let function_values = if context.track_nonempty_iterables {
+                    state
+                        .property_roots(function.identifier)
+                        .map(|values| values.iter().collect())
+                        .unwrap_or_else(|| state.values_for(function.identifier))
+                } else {
+                    state.values_for(function.identifier)
+                };
                 if function_values.len() == 1 {
                     let value_id = function_values[0];
                     if let Some(func_id) = context.function_values.get(&value_id).copied() {
@@ -2485,10 +2576,27 @@ fn apply_effect_ref<'a>(
             // cloning into a local so it is detached from the `env` borrow (the effect
             // computations below take `&mut env`). This mirrors the previous
             // `Rc<FunctionSignature>` snapshot taken at construction time.
-            let sig_owned = signature.and_then(|type_id| {
+            let mut sig_owned = signature.and_then(|type_id| {
                 let ty = &env.types[type_id];
                 env.get_function_signature(ty).ok().flatten().cloned()
             });
+            let mut builtin_push_receivers = Vec::new();
+            if context.track_nonempty_iterables
+                && sig_owned
+                    .as_ref()
+                    .is_some_and(|sig| sig.canonical_name.as_deref() == Some("Array.push"))
+            {
+                let receivers = state.property_roots(receiver.identifier).unwrap_or_default();
+                if !receivers.is_empty()
+                    && receivers.iter().all(|value| state.builtin_array_push.contains(&value))
+                {
+                    builtin_push_receivers.extend(receivers.iter());
+                } else {
+                    // Structural Array typing does not prove that an own push
+                    // property (or a changed prototype) still invokes the builtin.
+                    sig_owned = None;
+                }
+            }
             if let Some(sig) = &sig_owned {
                 let preserved_nonempty_receiver_values = if context.track_nonempty_iterables
                     && sig.canonical_name.as_deref() == Some("Array.push")
@@ -2538,6 +2646,8 @@ fn apply_effect_ref<'a>(
                             apply_effect(context, state, se, initialized, effects, env)?;
                         }
                         state.nonempty_iterable_values.extend(preserved_nonempty_receiver_values);
+                        state.builtin_array_push.extend(builtin_push_receivers.iter().copied());
+                        state.default_array_prototypes.extend(builtin_push_receivers);
                         return Ok(());
                     }
                 }
