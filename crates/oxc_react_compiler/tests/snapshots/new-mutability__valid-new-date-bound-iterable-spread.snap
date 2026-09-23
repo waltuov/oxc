@@ -1,0 +1,87 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-bound-iterable-spread.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(18);
+	const { timestamp, cond } = t0;
+	let t1;
+	if ($[0] !== timestamp) {
+		t1 = [timestamp];
+		$[0] = timestamp;
+		$[1] = t1;
+	} else {
+		t1 = $[1];
+	}
+	const inner = t1;
+	let t2;
+	if ($[2] !== inner) {
+		t2 = [...inner];
+		$[2] = inner;
+		$[3] = t2;
+	} else {
+		t2 = $[3];
+	}
+	const outer = t2;
+	const text = cond ? "0" : "1";
+	let t3;
+	if ($[4] !== text) {
+		t3 = [...text];
+		$[4] = text;
+		$[5] = t3;
+	} else {
+		t3 = $[5];
+	}
+	const fromString = t3;
+	const t4 = cond ? inner : outer;
+	let t5;
+	if ($[6] !== t4) {
+		t5 = [...t4];
+		$[6] = t4;
+		$[7] = t5;
+	} else {
+		t5 = $[7];
+	}
+	const fromBranch = t5;
+	let t6;
+	if ($[8] !== outer) {
+		t6 = new Date(...outer);
+		$[8] = outer;
+		$[9] = t6;
+	} else {
+		t6 = $[9];
+	}
+	let t7;
+	if ($[10] !== fromString) {
+		t7 = new Date(...fromString);
+		$[10] = fromString;
+		$[11] = t7;
+	} else {
+		t7 = $[11];
+	}
+	let t8;
+	if ($[12] !== fromBranch) {
+		t8 = new Date(...fromBranch);
+		$[12] = fromBranch;
+		$[13] = t8;
+	} else {
+		t8 = $[13];
+	}
+	let t9;
+	if ($[14] !== t6 || $[15] !== t7 || $[16] !== t8) {
+		t9 = [
+			t6,
+			t7,
+			t8
+		];
+		$[14] = t6;
+		$[15] = t7;
+		$[16] = t8;
+		$[17] = t9;
+	} else {
+		t9 = $[17];
+	}
+	return t9;
+}

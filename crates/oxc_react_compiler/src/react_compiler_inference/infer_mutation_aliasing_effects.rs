@@ -178,7 +178,6 @@ pub fn infer_mutation_aliasing_effects<'a>(
 
     let hoisted_context_declarations = find_hoisted_context_declarations(func, env);
     let non_mutating_spreads = find_non_mutated_destructure_spreads(func, env);
-    let nonempty_iterable_literals = find_nonempty_iterable_literals(func);
 
     let mut context = Context {
         alloc: env.allocator,
@@ -187,7 +186,6 @@ pub fn infer_mutation_aliasing_effects<'a>(
         is_function_expression,
         hoisted_context_declarations,
         non_mutating_spreads,
-        nonempty_iterable_literals,
         effect_value_id_cache: FxHashMap::default(),
         function_values: FxHashMap::default(),
         function_signature_cache: FxHashMap::default(),
@@ -812,8 +810,6 @@ struct Context<'a> {
     is_function_expression: bool,
     hoisted_context_declarations: FxHashMap<DeclarationId, Option<Place>>,
     non_mutating_spreads: FxHashSet<IdentifierId>,
-    /// Array and string literals guaranteed to supply at least one spread argument.
-    nonempty_iterable_literals: FxHashSet<IdentifierId>,
     /// Cache of ValueIds keyed by effect key, ensuring stable allocation-site identity
     /// across fixpoint iterations. Mirrors TS `effectInstructionValueCache`.
     effect_value_id_cache: FxHashMap<EffectKey, ValueId>,
@@ -1241,39 +1237,6 @@ fn find_non_mutated_destructure_spreads(
     non_mutating
 }
 
-fn find_nonempty_iterable_literals(func: &HirFunction) -> FxHashSet<IdentifierId> {
-    let mut nonempty = FxHashSet::default();
-    loop {
-        let mut changed = false;
-        for (_, block) in &func.body.blocks {
-            for &instruction_id in &block.instructions {
-                let instruction = &func.instructions[instruction_id.index()];
-                let is_nonempty = match &instruction.value {
-                    InstructionValue::ArrayExpression { elements, .. } => {
-                        elements.iter().any(|element| match element {
-                            ArrayElement::Spread(spread) => {
-                                nonempty.contains(&spread.place.identifier)
-                            }
-                            _ => true,
-                        })
-                    }
-                    InstructionValue::Primitive {
-                        value: PrimitiveValue::String(value), ..
-                    } => !value.is_empty(),
-                    _ => false,
-                };
-                if is_nonempty {
-                    changed |= nonempty.insert(instruction.lvalue.identifier);
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    nonempty
-}
-
 // =============================================================================
 // inferParam
 // =============================================================================
@@ -1383,9 +1346,38 @@ fn infer_block<'a>(
             context.instruction_signature_cache.insert(*instr_idx, Rc::new(sig));
         }
 
+        // Resolve spread cardinality from the current state, after prior loads,
+        // stores, phi joins, and mutations have been applied. A literal-only scan
+        // cannot recognize [...local] or invalidate a mutated spread operand.
+        let instruction = &func.instructions[instr_index];
+        let nonempty_iterable = match &instruction.value {
+            InstructionValue::ArrayExpression { elements, .. } => {
+                Some(elements.iter().any(|element| match element {
+                    ArrayElement::Spread(spread) => {
+                        state.is_nonempty_iterable(spread.place.identifier)
+                    }
+                    _ => true,
+                }))
+            }
+            InstructionValue::Primitive { value: PrimitiveValue::String(value), .. } => {
+                Some(!value.is_empty())
+            }
+            _ => None,
+        };
+
         // Apply signature
-        let effects =
-            apply_signature(context, state, *instr_idx, &func.instructions[instr_index], env)?;
+        let effects = apply_signature(context, state, *instr_idx, instruction, env)?;
+        if let Some(nonempty) = nonempty_iterable
+            && let Some(values) = state.variables.get(&instruction.lvalue.identifier)
+        {
+            for value in values.iter() {
+                if nonempty {
+                    state.nonempty_iterable_values.insert(value);
+                } else {
+                    state.nonempty_iterable_values.remove(&value);
+                }
+            }
+        }
         func.instructions[instr_index].effects = effects.map(|e| ArenaVec::from_iter_in(e, &alloc));
     }
 
@@ -1650,9 +1642,6 @@ fn apply_effect_ref<'a>(
             );
             initialized.insert(into.identifier);
             let value_id = context.get_or_create_value_id(effect);
-            if context.nonempty_iterable_literals.contains(&into.identifier) {
-                state.nonempty_iterable_values.insert(value_id);
-            }
             state.initialize(
                 value_id,
                 AbstractValue { kind: *kind, reason: ReasonSet::single(*reason) },
