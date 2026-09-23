@@ -47,6 +47,7 @@ use crate::react_compiler_hir::Pattern;
 use crate::react_compiler_hir::Place;
 use crate::react_compiler_hir::PlaceOrSpread;
 use crate::react_compiler_hir::PlaceOrSpreadOrHole;
+use crate::react_compiler_hir::PrimitiveValue;
 use crate::react_compiler_hir::PropertyLiteral;
 use crate::react_compiler_hir::ReactFunctionType;
 use crate::react_compiler_hir::SpreadPattern;
@@ -177,7 +178,7 @@ pub fn infer_mutation_aliasing_effects<'a>(
 
     let hoisted_context_declarations = find_hoisted_context_declarations(func, env);
     let non_mutating_spreads = find_non_mutated_destructure_spreads(func, env);
-    let nonempty_array_literals = find_nonempty_array_literals(func);
+    let nonempty_iterable_literals = find_nonempty_iterable_literals(func);
 
     let mut context = Context {
         alloc: env.allocator,
@@ -186,8 +187,7 @@ pub fn infer_mutation_aliasing_effects<'a>(
         is_function_expression,
         hoisted_context_declarations,
         non_mutating_spreads,
-        nonempty_array_literals,
-        nonempty_array_values: FxHashSet::default(),
+        nonempty_iterable_literals,
         effect_value_id_cache: FxHashMap::default(),
         function_values: FxHashMap::default(),
         function_signature_cache: FxHashMap::default(),
@@ -458,6 +458,8 @@ struct InferenceState {
     values: FxHashMap<ValueId, AbstractValue>,
     /// The set of values pointed to by each identifier.
     variables: FxHashMap<IdentifierId, ValueIdSet>,
+    /// Values guaranteed nonempty on every incoming path where they exist.
+    nonempty_iterable_values: FxHashSet<ValueId>,
     /// Tracks uninitialized identifier access errors (matches TS invariant).
     /// Uses Cell so it can be set from `&self` methods like `kind()`.
     /// Stores (IdentifierId, usage_span) where usage_span is the source location
@@ -471,6 +473,7 @@ impl InferenceState {
             is_function_expression,
             values: FxHashMap::default(),
             variables: FxHashMap::default(),
+            nonempty_iterable_values: FxHashSet::default(),
             uninitialized_access: Cell::new(None),
         }
     }
@@ -552,6 +555,21 @@ impl InferenceState {
         match self.variables.get(&place_id) {
             Some(values) => values.iter().collect(),
             None => Vec::new(),
+        }
+    }
+
+    fn is_nonempty_iterable(&self, place_id: IdentifierId) -> bool {
+        self.variables.get(&place_id).is_some_and(|values| {
+            !values.is_empty()
+                && values.iter().all(|value| self.nonempty_iterable_values.contains(&value))
+        })
+    }
+
+    fn copy_nonempty_iterable(&mut self, from: IdentifierId, into: ValueId) {
+        if self.is_nonempty_iterable(from) {
+            self.nonempty_iterable_values.insert(into);
+        } else {
+            self.nonempty_iterable_values.remove(&into);
         }
     }
 
@@ -661,16 +679,34 @@ impl InferenceState {
             }
         }
 
-        if next_variables.is_none() && next_values.is_none() {
+        let nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
+        if next_variables.is_none()
+            && next_values.is_none()
+            && nonempty_iterable_values == self.nonempty_iterable_values
+        {
             None
         } else {
             Some(InferenceState {
                 is_function_expression: self.is_function_expression,
                 values: next_values.unwrap_or_else(|| self.values.clone()),
                 variables: next_variables.unwrap_or_else(|| self.variables.clone()),
+                nonempty_iterable_values,
                 uninitialized_access: Cell::new(None),
             })
         }
+    }
+
+    fn merged_nonempty_iterable_values(&self, other: &Self) -> FxHashSet<ValueId> {
+        // A branch-local allocation need only be nonempty on the paths where it
+        // exists. Shared allocations must retain the fact on both paths.
+        let mut values = self.nonempty_iterable_values.clone();
+        values.retain(|value| {
+            !other.values.contains_key(value) || other.nonempty_iterable_values.contains(value)
+        });
+        values.extend(
+            other.nonempty_iterable_values.iter().filter(|value| !self.values.contains_key(value)),
+        );
+        values
     }
 
     /// In-place variant of [`InferenceState::merge`] for updating an
@@ -681,6 +717,7 @@ impl InferenceState {
     /// `merge`'s result, the access flag ends up cleared (queued states never
     /// carry a set flag: a set flag errors out before the state is queued).
     fn merge_from(&mut self, other: &InferenceState) {
+        self.nonempty_iterable_values = self.merged_nonempty_iterable_values(other);
         for (id, other_value) in &other.values {
             match self.values.get(id) {
                 Some(this_value) => {
@@ -775,11 +812,8 @@ struct Context<'a> {
     is_function_expression: bool,
     hoisted_context_declarations: FxHashMap<DeclarationId, Option<Place>>,
     non_mutating_spreads: FxHashSet<IdentifierId>,
-    /// Array literal temporaries that are guaranteed to contain at least one element.
-    nonempty_array_literals: FxHashSet<IdentifierId>,
-    /// Allocation values for guaranteed-nonempty array literals. Tracking the
-    /// allocation lets the fact survive local stores, loads, and phi aliases.
-    nonempty_array_values: FxHashSet<ValueId>,
+    /// Array and string literals guaranteed to supply at least one spread argument.
+    nonempty_iterable_literals: FxHashSet<IdentifierId>,
     /// Cache of ValueIds keyed by effect key, ensuring stable allocation-site identity
     /// across fixpoint iterations. Mirrors TS `effectInstructionValueCache`.
     effect_value_id_cache: FxHashMap<EffectKey, ValueId>,
@@ -1207,19 +1241,28 @@ fn find_non_mutated_destructure_spreads(
     non_mutating
 }
 
-fn find_nonempty_array_literals(func: &HirFunction) -> FxHashSet<IdentifierId> {
+fn find_nonempty_iterable_literals(func: &HirFunction) -> FxHashSet<IdentifierId> {
     let mut nonempty = FxHashSet::default();
     loop {
         let mut changed = false;
         for (_, block) in &func.body.blocks {
             for &instruction_id in &block.instructions {
                 let instruction = &func.instructions[instruction_id.index()];
-                if let InstructionValue::ArrayExpression { elements, .. } = &instruction.value
-                    && elements.iter().any(|element| match element {
-                        ArrayElement::Spread(spread) => nonempty.contains(&spread.place.identifier),
-                        _ => true,
-                    })
-                {
+                let is_nonempty = match &instruction.value {
+                    InstructionValue::ArrayExpression { elements, .. } => {
+                        elements.iter().any(|element| match element {
+                            ArrayElement::Spread(spread) => {
+                                nonempty.contains(&spread.place.identifier)
+                            }
+                            _ => true,
+                        })
+                    }
+                    InstructionValue::Primitive {
+                        value: PrimitiveValue::String(value), ..
+                    } => !value.is_empty(),
+                    _ => false,
+                };
+                if is_nonempty {
                     changed |= nonempty.insert(instruction.lvalue.identifier);
                 }
             }
@@ -1607,8 +1650,8 @@ fn apply_effect_ref<'a>(
             );
             initialized.insert(into.identifier);
             let value_id = context.get_or_create_value_id(effect);
-            if context.nonempty_array_literals.contains(&into.identifier) {
-                context.nonempty_array_values.insert(value_id);
+            if context.nonempty_iterable_literals.contains(&into.identifier) {
+                state.nonempty_iterable_values.insert(value_id);
             }
             state.initialize(
                 value_id,
@@ -1838,6 +1881,7 @@ fn apply_effect_ref<'a>(
                         value_id,
                         AbstractValue { kind: from_value.kind, reason: from_value.reason },
                     );
+                    state.copy_nonempty_iterable(from.identifier, value_id);
                     state.define(into.identifier, value_id);
                 }
                 ValueKind::Global | ValueKind::Primitive => {
@@ -1851,6 +1895,7 @@ fn apply_effect_ref<'a>(
                         value_id,
                         AbstractValue { kind: from_value.kind, reason: from_value.reason },
                     );
+                    state.copy_nonempty_iterable(from.identifier, value_id);
                     state.define(into.identifier, value_id);
                 }
                 _ => {
@@ -1935,18 +1980,14 @@ fn apply_effect_ref<'a>(
                             PlaceOrSpreadOrHole::Place(_) => true,
                             PlaceOrSpreadOrHole::Hole => false,
                             PlaceOrSpreadOrHole::Spread(spread) => {
-                                let values = state.values_for(spread.place.identifier);
-                                !values.is_empty()
-                                    && values.iter().all(|value_id| {
-                                        context.nonempty_array_values.contains(value_id)
-                                    })
+                                state.is_nonempty_iterable(spread.place.identifier)
                             }
                         });
                         state
                             .values_for(receiver.identifier)
                             .into_iter()
                             .filter(|value_id| {
-                                adds_element || context.nonempty_array_values.contains(value_id)
+                                adds_element || state.nonempty_iterable_values.contains(value_id)
                             })
                             .collect::<Vec<_>>()
                     } else {
@@ -1977,7 +2018,7 @@ fn apply_effect_ref<'a>(
                         for se in sig_effs {
                             apply_effect(context, state, se, initialized, effects, env)?;
                         }
-                        context.nonempty_array_values.extend(preserved_nonempty_receiver_values);
+                        state.nonempty_iterable_values.extend(preserved_nonempty_receiver_values);
                         return Ok(());
                     }
                 }
@@ -1994,7 +2035,6 @@ fn apply_effect_ref<'a>(
                     span.as_ref(),
                     env,
                     &context.function_values,
-                    &context.nonempty_array_values,
                     &mut todo_errors,
                 );
                 // Todo errors should short-circuit (TS throws throwTodo)
@@ -2097,7 +2137,7 @@ fn apply_effect_ref<'a>(
             let mutation_kind = state.mutate_with_span(variant, value.identifier, env, value.span);
             if mutation_kind == MutationResult::Mutate {
                 for value_id in state.values_for(value.identifier) {
-                    context.nonempty_array_values.remove(&value_id);
+                    state.nonempty_iterable_values.remove(&value_id);
                 }
                 effects.push(effect.clone_in(context.alloc));
             } else if mutation_kind == MutationResult::MutateRef {
@@ -2612,7 +2652,6 @@ fn compute_effects_for_legacy_signature<'a>(
     span: Option<&Span>,
     env: &Environment<'a>,
     function_values: &FxHashMap<ValueId, FunctionId>,
-    nonempty_array_values: &FxHashSet<ValueId>,
     todo_errors: &mut Vec<OxcDiagnostic>,
 ) -> Vec<AliasingEffect<'a>> {
     let return_value_reason = signature.return_value_reason.unwrap_or(ValueReason::Other);
@@ -2632,9 +2671,7 @@ fn compute_effects_for_legacy_signature<'a>(
                 PlaceOrSpreadOrHole::Place(_) => false,
                 PlaceOrSpreadOrHole::Hole => true,
                 PlaceOrSpreadOrHole::Spread(spread) => {
-                    let values = state.values_for(spread.place.identifier);
-                    values.is_empty()
-                        || !values.iter().all(|value| nonempty_array_values.contains(value))
+                    !state.is_nonempty_iterable(spread.place.identifier)
                 }
             }))
     {

@@ -1,0 +1,46 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-string-spread.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(6);
+	const { cond } = t0;
+	const text = cond ? "0" : "1";
+	let t1;
+	if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
+		t1 = new Date(..."0");
+		$[0] = t1;
+	} else {
+		t1 = $[0];
+	}
+	let t2;
+	if ($[1] !== text) {
+		t2 = new Date(...text);
+		$[1] = text;
+		$[2] = t2;
+	} else {
+		t2 = $[2];
+	}
+	let t3;
+	if ($[3] === Symbol.for("react.memo_cache_sentinel")) {
+		t3 = new Date(...[..."0"]);
+		$[3] = t3;
+	} else {
+		t3 = $[3];
+	}
+	let t4;
+	if ($[4] !== t2) {
+		t4 = [
+			t1,
+			t2,
+			t3
+		];
+		$[4] = t2;
+		$[5] = t4;
+	} else {
+		t4 = $[5];
+	}
+	return t4;
+}

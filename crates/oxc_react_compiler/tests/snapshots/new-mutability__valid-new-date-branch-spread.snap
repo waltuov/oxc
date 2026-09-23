@@ -1,0 +1,55 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/new-mutability/valid-new-date-branch-spread.js
+---
+import { c as _c } from "react/compiler-runtime";
+// @validateNoImpureFunctionsInRender @enableNewMutationAliasingModel
+function Component(t0) {
+	const $ = _c(11);
+	const { timestamp, cond } = t0;
+	let args;
+	let t1;
+	if ($[0] !== cond || $[1] !== timestamp) {
+		args = [];
+		if (cond) {
+			args.push(timestamp);
+		} else {
+			args.push(0);
+		}
+		t1 = cond ? [timestamp] : [0];
+		$[0] = cond;
+		$[1] = timestamp;
+		$[2] = args;
+		$[3] = t1;
+	} else {
+		args = $[2];
+		t1 = $[3];
+	}
+	const branchLocalArgs = t1;
+	let t2;
+	if ($[4] !== args) {
+		t2 = new Date(...args);
+		$[4] = args;
+		$[5] = t2;
+	} else {
+		t2 = $[5];
+	}
+	let t3;
+	if ($[6] !== branchLocalArgs) {
+		t3 = new Date(...branchLocalArgs);
+		$[6] = branchLocalArgs;
+		$[7] = t3;
+	} else {
+		t3 = $[7];
+	}
+	let t4;
+	if ($[8] !== t2 || $[9] !== t3) {
+		t4 = [t2, t3];
+		$[8] = t2;
+		$[9] = t3;
+		$[10] = t4;
+	} else {
+		t4 = $[10];
+	}
+	return t4;
+}
